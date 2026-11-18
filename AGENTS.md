@@ -28,7 +28,7 @@ The app has two product flavors:
 
 | Flavor  | Application ID                      | Distribution |
 |---------|-------------------------------------|-------------|
-| fdroid  | `dev.henriquecouto.calsync`         | F-Droid     |
+| fdroid  | `de.schellboy.calsyncfamily`       | F-Droid     |
 | gplay   | `dev.henriquecouto.calsync_gplay`   | Google Play |
 
 The `fdroid` flavor is the default (no `--flavor` needed). The `gplay` flavor requires `--flavor gplay`:

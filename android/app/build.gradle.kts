@@ -26,7 +26,8 @@ android {
 
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "dev.henriquecouto.calsync"
+        applicationId = "de.schellboy.calsyncfamily"
+        manifestPlaceholders["launcherAppLabel"] = "CalSync Family"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
@@ -41,6 +42,7 @@ android {
             create("gplay") {
                 dimension = "store"
                 applicationId = "dev.henriquecouto.calsync_gplay"
+                manifestPlaceholders["launcherAppLabel"] = "CalSync"
             }
         }
     }
