@@ -58,14 +58,11 @@ For CI / one-shot builds, use `scripts/gplay_build.sh` which handles swap + buil
 
 ```
 
-## Release
+## Android test builds
 
-Releases are managed via GitHub Actions (`.github/workflows/release.yml`):
+The workflow `.github/workflows/build-debug-apk.yml` runs on pushes to `main` and via manual dispatch. It builds the default F-Droid debug APK and uploads it as the `CalSync-Family-Debug-APK` Actions artifact. GitHub Actions does not publish releases, create tags, or upload to the Play Store.
 
-- **Automatic**: On push to `main`, builds fdroid APKs + gplay APK + gplay AAB and creates a GitHub Release.
-- **Manual Play Store upload**: Trigger `workflow_dispatch` in GitHub Actions UI, select a track (`internal`, `alpha`, `beta`, `production`).
-
-### Local Play Store upload (via Fastlane)
+## Local Play Store upload (via Fastlane)
 
 Prerequisites:
 - Ruby + Bundler installed (`ruby-devel` package on Fedora)
