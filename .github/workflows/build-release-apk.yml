@@ -1,0 +1,73 @@
+name: Build signed Android release APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-release-apk:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: android-release
+    steps:
+      - name: Require a private repository
+        if: github.event.repository.private != true
+        run: |
+          echo "::error::Use a private repository before building an APK with the permanent release key."
+          exit 1
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.47.0'
+
+      - name: Install dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Build and verify signed APK
+        shell: bash
+        env:
+          CALSYNCFAMILY_KEYSTORE_BASE64: ${{ secrets.CALSYNCFAMILY_KEYSTORE_BASE64 }}
+          CALSYNCFAMILY_STORE_PASSWORD: ${{ secrets.CALSYNCFAMILY_STORE_PASSWORD }}
+          CALSYNCFAMILY_KEY_ALIAS: ${{ secrets.CALSYNCFAMILY_KEY_ALIAS }}
+          CALSYNCFAMILY_KEY_PASSWORD: ${{ secrets.CALSYNCFAMILY_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in CALSYNCFAMILY_KEYSTORE_BASE64 CALSYNCFAMILY_STORE_PASSWORD CALSYNCFAMILY_KEY_ALIAS CALSYNCFAMILY_KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required Android release secret: $name"
+              exit 1
+            fi
+          done
+          umask 077
+          signing_dir=$(mktemp -d "$RUNNER_TEMP/calsync-signing.XXXXXX")
+          trap 'rm -rf -- "$signing_dir"' EXIT
+          export CALSYNCFAMILY_KEYSTORE_PATH="$signing_dir/release.jks"
+          if ! printf '%s' "$CALSYNCFAMILY_KEYSTORE_BASE64" | base64 --decode > "$CALSYNCFAMILY_KEYSTORE_PATH"; then
+            echo "::error::The Android release keystore secret is not valid Base64."
+            exit 1
+          fi
+          unset CALSYNCFAMILY_KEYSTORE_BASE64
+          flutter build apk --release --no-pub
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Upload signed release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CalSync-Family-Release-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error

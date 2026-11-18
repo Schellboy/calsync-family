@@ -1,10 +1,47 @@
 import com.android.build.gradle.internal.api.ApkVariantOutputImpl
+import java.security.KeyStore
+import java.security.PrivateKey
 import java.util.Properties
 
 val keystorePropertiesFile = rootProject.file("key.properties")
 val keystoreProperties = Properties()
 if (keystorePropertiesFile.exists()) {
-    keystoreProperties.load(keystorePropertiesFile.inputStream())
+    keystorePropertiesFile.inputStream().use { keystoreProperties.load(it) }
+}
+
+val ciKeystorePath = providers.environmentVariable("CALSYNCFAMILY_KEYSTORE_PATH").orNull
+val releaseStoreFile = (ciKeystorePath ?: keystoreProperties.getProperty("storeFile"))
+    ?.takeIf { it.isNotBlank() }?.let { file(it) }
+val releaseStorePassword = if (ciKeystorePath != null)
+    providers.environmentVariable("CALSYNCFAMILY_STORE_PASSWORD").orNull
+else keystoreProperties.getProperty("storePassword")
+val releaseKeyAlias = if (ciKeystorePath != null)
+    providers.environmentVariable("CALSYNCFAMILY_KEY_ALIAS").orNull
+else keystoreProperties.getProperty("keyAlias")
+val releaseKeyPassword = if (ciKeystorePath != null)
+    providers.environmentVariable("CALSYNCFAMILY_KEY_PASSWORD").orNull
+else keystoreProperties.getProperty("keyPassword")
+
+val validateReleaseSigningInputs = tasks.register("validateReleaseSigningInputs") {
+    doLast {
+        if (releaseStoreFile?.isFile != true || !releaseStoreFile.canRead() ||
+            releaseStorePassword.isNullOrBlank() || releaseKeyAlias.isNullOrBlank() ||
+            releaseKeyPassword.isNullOrBlank()
+        ) {
+            throw GradleException(
+                "CalSync release signing requires a readable keystore and all signing settings. " +
+                    "Configure android/key.properties locally or supply the CALSYNCFAMILY signing variables in CI."
+            )
+        }
+        val hasSigningKey = runCatching {
+            val keystore = KeyStore.getInstance(releaseStoreFile, releaseStorePassword.toCharArray())
+            keystore.getKey(releaseKeyAlias, releaseKeyPassword.toCharArray()) is PrivateKey &&
+                keystore.getCertificate(releaseKeyAlias) != null
+        }.getOrDefault(false)
+        if (!hasSigningKey) {
+            throw GradleException("CalSync release signing could not unlock the signing key. Check the keystore, alias and passwords.")
+        }
+    }
 }
 
 plugins {
@@ -49,22 +86,16 @@ android {
 
     signingConfigs {
         create("release") {
-            if (keystorePropertiesFile.exists()) {
-                storeFile = file(keystoreProperties["storeFile"] as String)
-                storePassword = keystoreProperties["storePassword"] as String
-                keyAlias = keystoreProperties["keyAlias"] as String
-                keyPassword = keystoreProperties["keyPassword"] as String
-            }
+            storeFile = releaseStoreFile
+            storePassword = releaseStorePassword
+            keyAlias = releaseKeyAlias
+            keyPassword = releaseKeyPassword
         }
     }
 
     buildTypes {
         release {
-            signingConfig = if (keystorePropertiesFile.exists()) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
-            }
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -90,6 +121,14 @@ android.applicationVariants.configureEach {
 }
 
 androidComponents {
+    onVariants(selector().withBuildType("release")) { variant ->
+        val taskSuffix = variant.name.replaceFirstChar { it.uppercaseChar() }
+        tasks.configureEach {
+            if (name == "pre${taskSuffix}Build" || name == "validateSigning${taskSuffix}") {
+                dependsOn(validateReleaseSigningInputs)
+            }
+        }
+    }
     onVariants { variant ->
         if (variant.flavorName == "gplay") {
             variant.packaging.resources.excludes.add("**/adi-registration.properties")
