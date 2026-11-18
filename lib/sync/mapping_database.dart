@@ -124,6 +124,22 @@ class MappingDatabase {
         rows.single['has_duplicate_source'] == 0;
   }
 
+  Future<T> _withWriteConnection<T>(Future<T> Function(Database) write) async {
+    final main = await database;
+    // SQLite can leave a transaction open when COMMIT fails. Closing this
+    // independent connection rolls it back without blocking the shared handle.
+    final connection = await openDatabase(
+      main.path,
+      singleInstance: false,
+      onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+    );
+    try {
+      return await write(connection);
+    } finally {
+      await connection.close();
+    }
+  }
+
   Future<bool> reserveCreation(
     String profileId,
     String sourceCalendarId,
@@ -131,8 +147,7 @@ class MappingDatabase {
     String? instanceId,
     String targetCalendarId,
   ) async {
-    final db = await database;
-    return db.transaction((txn) async {
+    return _withWriteConnection((db) => db.transaction((txn) async {
       final profiles = await txn.query(
         'sync_profiles',
         where:
@@ -140,6 +155,10 @@ class MappingDatabase {
         whereArgs: [profileId, sourceCalendarId, targetCalendarId],
       );
       if (profiles.isEmpty) return false;
+      final mutations = await txn.query(
+        'sync_target_mutations', where: 'profile_id = ?', whereArgs: [profileId], limit: 1,
+      );
+      if (mutations.isNotEmpty) return false;
       final key = [
         profileId,
         sourceCalendarId,
@@ -165,7 +184,7 @@ class MappingDatabase {
         'source_instance_id': instanceId ?? '',
       });
       return true;
-    });
+    }));
   }
 
   static const _reservationKey =
@@ -179,8 +198,7 @@ class MappingDatabase {
     required String targetCalendarId,
     required String targetEventId,
   }) async {
-    final db = await database;
-    await db.transaction((txn) async {
+    await _withWriteConnection((db) => db.transaction((txn) async {
       await txn.insert(_tableName, {
         _columnProfileId: profileId,
         _columnSourceCalendarId: sourceCalendarId,
@@ -207,7 +225,18 @@ class MappingDatabase {
       if (count != 1) {
         throw StateError('The calendar write has no reservation.');
       }
-    });
+    }));
+  }
+
+  Future<bool> hasPendingMutations(String profileId) async {
+    final db = await database;
+    final rows = await db.query(
+      'sync_target_mutations',
+      where: 'profile_id = ?',
+      whereArgs: [profileId],
+      limit: 1,
+    );
+    return rows.isNotEmpty;
   }
 
   Future<bool> changeOwnedTarget(
@@ -216,41 +245,57 @@ class MappingDatabase {
     bool removeMapping = false,
     bool requireEnabledProfile = false,
   }) async {
-    final db = await database;
-    return db.transaction((txn) async {
+    final mappingId = mapping['id'];
+    final args = [mapping['target_calendar_id'], mapping['target_event_id']];
+    final reserved = await _withWriteConnection((db) => db.transaction((txn) async {
       if (!await _ownsTarget(txn, mapping)) return false;
       if (requireEnabledProfile) {
         final active = await txn.query(
           'sync_profiles',
-          where:
-              'id = ? AND source_calendar_id = ? AND target_calendar_id = ? AND enabled = 1',
-          whereArgs: [
-            mapping['profile_id'],
-            mapping['source_calendar_id'],
-            mapping['target_calendar_id'],
-          ],
+          where: 'id = ? AND source_calendar_id = ? AND target_calendar_id = ? AND enabled = 1',
+          whereArgs: [mapping['profile_id'], mapping['source_calendar_id'], args.first],
           limit: 1,
         );
         if (active.isEmpty) return false;
       }
-      if (!await change()) return false;
-      if (removeMapping) {
-        await txn.delete(
-          _tableName,
-          where: 'id = ?',
-          whereArgs: [mapping['id']],
-        );
+      final pending = await txn.query(
+        'sync_target_mutations',
+        where: 'profile_id = ? OR (target_calendar_id = ? AND target_event_id = ?)',
+        whereArgs: [mapping['profile_id'], ...args],
+        limit: 1,
+      );
+      if (pending.isNotEmpty) return false;
+      await txn.insert('sync_target_mutations', {
+        'mapping_id': mappingId,
+        'profile_id': mapping['profile_id'],
+        'target_calendar_id': args.first,
+        'target_event_id': args.last,
+        'operation': removeMapping ? 'delete' : 'update',
+        'started_at': DateTime.now().toUtc().toIso8601String(),
+      });
+      return true;
+    }));
+    if (!reserved) return false;
+
+    // This write crosses the SQLite/Android boundary. If it throws or the
+    // second transaction fails, retain the committed intent for review.
+    final changed = await change();
+    await _withWriteConnection((db) => db.transaction((txn) async {
+      if (changed && removeMapping) {
+        final removed = await txn.delete(_tableName, where: 'id = ?', whereArgs: [mappingId]);
+        if (removed != 1) throw StateError('The calendar deletion could not be recorded.');
         await txn.delete(
           _createdEventsTable,
           where: 'calendar_id = ? AND event_id = ?',
-          whereArgs: [
-            mapping['target_calendar_id'],
-            mapping['target_event_id'],
-          ],
+          whereArgs: args,
         );
       }
-      return true;
-    });
+      final finalized = await txn.delete(
+        'sync_target_mutations', where: 'mapping_id = ?', whereArgs: [mappingId],
+      );
+      if (finalized != 1) throw StateError('The calendar intent could not be finalized.');
+    }));
+    return changed;
   }
 
   Future<List<Map<String, Object?>>> listMappingsForCalendar(

@@ -49,7 +49,8 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
   String? _targetCalendarId;
   int _intervalMinutes = 60;
   int _syncWindowDays = 30;
-  bool _syncEnabled = true;
+  bool _syncEnabled = !CalendarService.isFamilyTestBuild;
+  String? _testTargetId;
   bool _copyDescription = false;
   bool _copyLocation = false;
   bool _omitSourceTitle = false;
@@ -88,6 +89,9 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
 
   Future<void> _load() async {
     final calendars = await _calendarService.listCalendars();
+    if (CalendarService.isFamilyTestBuild && calendars.isNotEmpty) {
+      _testTargetId = (await _calendarService.familyTestCalendars())['target'];
+    }
 
     if (_isEditing) {
       final profiles = await _profileService.listProfiles();
@@ -108,6 +112,7 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
       }
     }
 
+    if (!mounted) return;
     setState(() {
       _isCreateMode = !_isEditing;
       _calendars = calendars
@@ -120,6 +125,20 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
           .toList();
       _loading = false;
     });
+  }
+
+  Future<void> _prepareTestCalendars() async {
+    setState(() => _loading = true);
+    try {
+      await _calendarService.prepareFamilyTestCalendars();
+      await _load();
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _loading = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('The device could not create isolated test calendars.')),
+      );
+    }
   }
 
   String? _validate() {
@@ -207,7 +226,7 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
           sourceCalendarId: _sourceCalendarId,
           targetCalendarId: _targetCalendarId,
           eventName: eventName,
-          intervalMinutes: _intervalMinutes,
+          intervalMinutes: CalendarService.isFamilyTestBuild ? 0 : _intervalMinutes,
           syncWindowDays: _syncWindowDays,
           enabled: _enableRestricted ? false : _syncEnabled,
           copyDescription: _copyDescription,
@@ -221,7 +240,7 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
         sourceCalendarId: _sourceCalendarId,
         targetCalendarId: _targetCalendarId,
         eventName: eventName,
-        intervalMinutes: _intervalMinutes,
+        intervalMinutes: CalendarService.isFamilyTestBuild ? 0 : _intervalMinutes,
         syncWindowDays: _syncWindowDays,
         enabled: _syncEnabled,
         copyDescription: _copyDescription,
@@ -292,7 +311,7 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
             current.length != targets.length ||
             !current.every((row) => targets.any((target) => target.mapping['id'] == row['id'])) ||
             !await engine.deleteConfirmedTargets(targets)) {
-          throw StateError('Cleanup stopped. The profile is paused. Review the remaining target events.');
+          throw StateError('Cleanup stopped and the profile is paused. Some events may already have been removed. Check the target calendar.');
         }
       }
       await _profileService.deleteProfile(profileId);
@@ -395,6 +414,13 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
                             },
                           ),
                           const SizedBox(height: 16),
+                          if (CalendarService.isFamilyTestBuild) ...[
+                            const Text('Manual sync only. The test app uses three isolated local calendars.'),
+                            OutlinedButton(
+                              onPressed: _prepareTestCalendars,
+                              child: const Text('Prepare isolated test calendars'),
+                            ),
+                          ],
                           if (_calendars.isEmpty)
                             const EmptyState(
                               icon: Icons.calendar_month,
@@ -407,7 +433,8 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
                               errorText: _pairingError,
                               expandedInsets: EdgeInsets.zero,
                               menuHeight: 320,
-                              dropdownMenuEntries: _calendars.map((c) {
+                              dropdownMenuEntries: _calendars.where((c) =>
+                                !CalendarService.isFamilyTestBuild || c.id != _testTargetId).map((c) {
                                 return DropdownMenuEntry(
                                     value: c.id, label: c.displayName);
                               }).toList(),
@@ -427,7 +454,8 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
                               errorText: _pairingError,
                               expandedInsets: EdgeInsets.zero,
                               menuHeight: 320,
-                              dropdownMenuEntries: _calendars.map((c) {
+                              dropdownMenuEntries: _calendars.where((c) =>
+                                !CalendarService.isFamilyTestBuild || c.id == _testTargetId).map((c) {
                                 return DropdownMenuEntry(
                                   value: c.id,
                                   label: c.readOnly
@@ -502,6 +530,7 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
                           ),
                         ),
                         const SizedBox(height: 16),
+                        if (!CalendarService.isFamilyTestBuild)
                         DropdownMenu<int>(
                           initialSelection: _intervalMinutes,
                           label: const Text('Fallback Interval'),

@@ -28,6 +28,7 @@ android {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "de.schellboy.calsyncfamily"
         manifestPlaceholders["launcherAppLabel"] = "CalSync Family"
+        manifestPlaceholders["allowCalendarBackup"] = "true"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
@@ -43,6 +44,18 @@ android {
                 dimension = "store"
                 applicationId = "dev.henriquecouto.calsync_gplay"
                 manifestPlaceholders["launcherAppLabel"] = "CalSync"
+            }
+        }
+    }
+
+    if (gradle.startParameter.taskNames.any { it.contains("FamilyTest", ignoreCase = true) }) {
+        if (!flavorDimensions.contains("store")) flavorDimensions += "store"
+        productFlavors {
+            create("familyTest") {
+                dimension = "store"
+                applicationIdSuffix = ".test"
+                manifestPlaceholders["launcherAppLabel"] = "CalSync Family Test"
+                manifestPlaceholders["allowCalendarBackup"] = "false"
             }
         }
     }

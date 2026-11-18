@@ -53,6 +53,8 @@ class TestCalendar extends CalendarService {
   bool offline = false;
   bool permissionDenied = false;
   bool rejectUpdate = false;
+  bool failAfterUpdate = false;
+  Future<void> Function()? beforeDelete;
   bool rejectDelete = false;
   bool failAfterCreate = false;
   Future<void> Function()? afterCreate;
@@ -158,11 +160,13 @@ class TestCalendar extends CalendarService {
       allDay: allDay,
       location: location,
     );
+    if (failAfterUpdate) throw StateError('response lost');
     return true;
   }
 
   @override
   Future<bool> deleteOwnedEvent(Event expected) async {
+    await beforeDelete?.call();
     if (rejectDelete ||
         !await canDeleteEvents() ||
         !identical(events[expected.eventId], expected)) {
@@ -754,6 +758,8 @@ void main() {
       expect(await db.isEventCreatedBySync('family', 'target'), isTrue);
       expect(await engine.deleteConfirmedTargets(plan.toDelete), isFalse);
       expect(calendar.deleted, ['target']);
+      expect(await db.hasPendingMutations(profile.id), isTrue);
+      expect((await preview()).errors.single, contains('unconfirmed'));
     },
   );
 
@@ -763,6 +769,7 @@ void main() {
       await map('match', 'target');
       final old = await db.database;
       await old.execute('DROP TABLE sync_creation_reservations');
+      await old.execute('DROP TABLE sync_target_mutations');
       await old.execute('PRAGMA user_version = 9');
       await old.close();
       DatabaseProvider.setTestPath('${temp.path}/calendar.db');
@@ -771,7 +778,7 @@ void main() {
       final migrated = await db.database;
       expect(
         (await migrated.rawQuery('PRAGMA user_version')).single.values.single,
-        10,
+        11,
       );
       expect((await profiles.getProfile(profile.id))!.name, 'First team');
       expect(await db.isEventSynced(profile.id, 'source', 'match'), isTrue);
@@ -788,6 +795,351 @@ void main() {
       await db.insertCreatedEvent('source', 'tracked');
       expect((await sync()).skipped, ['tracked', 'marked']);
       expect(calendar.creates, 0);
+    },
+  );
+
+  test(
+    'an old standalone target outside the safety window is preserved',
+    () async {
+      final old = DateTime.now().subtract(const Duration(days: 10));
+      calendar.events['target'] = event(
+        'target',
+        calendar: 'family',
+        from: old,
+        until: old,
+        description: buildDescription('Training', null, false),
+      );
+      await map('match', 'target');
+      calendar.failedReads.add('match');
+      final plan = await preview();
+      expect(plan.toDelete, isEmpty);
+      expect(plan.errors, isEmpty);
+      expect(await db.isEventSynced(profile.id, 'source', 'match'), isTrue);
+    },
+  );
+
+  test(
+    'an unchanged recent source outside the listing is classified by ID',
+    () async {
+      final yesterday = DateTime.now().subtract(const Duration(days: 1));
+      calendar.events['match'] = event(
+        'match',
+        from: yesterday,
+        until: yesterday,
+      );
+      calendar.events['target'] = event(
+        'target',
+        calendar: 'family',
+        from: yesterday,
+        until: yesterday,
+        description: buildDescription('Training', null, false),
+      );
+      await map('match', 'target');
+      expect((await preview()).toSkip.single.eventId, 'match');
+    },
+  );
+
+  test('an all-day date move updates the same existing target', () async {
+    final day = DateTime(start.year, start.month, start.day);
+    final tomorrow = DateTime(day.year, day.month, day.day + 1);
+    final later = DateTime(day.year, day.month, day.day + 2);
+    calendar.events['match'] = event(
+      'match',
+      from: tomorrow,
+      until: later,
+      allDay: true,
+    );
+    calendar.events['target'] = event(
+      'target',
+      calendar: 'family',
+      from: day,
+      until: tomorrow,
+      allDay: true,
+      description: buildDescription('Training', null, false),
+    );
+    await map('match', 'target');
+    expect((await sync()).updated, ['match']);
+    expect(calendar.events['target']!.startDate, tomorrow);
+    expect(calendar.events['target']!.endDate, later);
+    expect(calendar.creates, 0);
+  });
+
+  test(
+    'create transfers exact timed dates and profile title without optional location',
+    () async {
+      calendar.events['match'] = event(
+        'match',
+        description: 'Old text',
+        location: 'Pitch',
+      );
+      expect(
+        (await sync(
+          title: 'Busy',
+          copyDescription: false,
+          copyLocation: false,
+        )).synced,
+        ['match'],
+      );
+      final written = calendar.events['created-1']!;
+      expect(written.title, 'Busy');
+      expect(written.description, buildDescription('Training', null, false));
+      expect(written.location, isNull);
+      expect(written.startDate, start);
+      expect(written.endDate, end);
+      expect(written.isAllDay, isFalse);
+    },
+  );
+
+  test('an unchanged Google-style description wrapper is recognized', () async {
+    calendar.events['match'] = event('match');
+    final wrapped =
+        "<p>${buildDescription('Training', null, false).replaceAll('\n', '<br>')}</p>";
+    calendar.events['target'] = target('target', desc: wrapped);
+    await map('match', 'target');
+    expect((await sync()).skipped, ['match']);
+    expect(calendar.updated, isEmpty);
+  });
+
+  test(
+    'a mapped target without its marker is protected even when registered',
+    () async {
+      calendar.events['match'] = event('match', title: 'New');
+      calendar.events['target'] = event('target', calendar: 'family');
+      await map('match', 'target');
+      expect((await preview()).errors, isNotEmpty);
+      expect((await sync()).updated, isEmpty);
+      expect(calendar.deleted, isEmpty);
+    },
+  );
+
+  test(
+    'confirmed delete removes the creation registry only for its target',
+    () async {
+      await removeSource();
+      await db.insertCreatedEvent('family', 'other');
+      final plan = await preview();
+      expect(await engine.deleteConfirmedTargets(plan.toDelete), isTrue);
+      expect(await db.isEventCreatedBySync('family', 'target'), isFalse);
+      expect(await db.isEventCreatedBySync('family', 'other'), isTrue);
+    },
+  );
+
+  test(
+    'reverse sync skips a target actually created by the first profile',
+    () async {
+      calendar.events['match'] = event('match');
+      expect((await sync()).synced, ['match']);
+      final reverse = await profiles.createProfile(
+        name: 'Reverse',
+        sourceCalendarId: 'family',
+        targetCalendarId: 'source',
+        eventName: '',
+        intervalMinutes: 60,
+        enabled: true,
+      );
+      final result = await engine.runSync(
+        profileId: reverse.id,
+        sourceCalendarId: 'family',
+        targetCalendarId: 'source',
+        syncEventName: '',
+      );
+      expect(result.skipped, ['created-1']);
+      expect(calendar.creates, 1);
+    },
+  );
+
+  test('the same source ID is independently scoped to profiles', () async {
+    calendar.events['match'] = event('match');
+    final second = await profiles.createProfile(
+      name: 'Different destination',
+      sourceCalendarId: 'source',
+      targetCalendarId: 'other-family',
+      eventName: '',
+      intervalMinutes: 60,
+      enabled: true,
+    );
+    expect((await sync()).synced, ['match']);
+    final result = await engine.runSync(
+      profileId: second.id,
+      sourceCalendarId: 'source',
+      targetCalendarId: 'other-family',
+      syncEventName: '',
+    );
+    expect(result.synced, ['match']);
+    expect(
+      (await db.listMappingsForProfile(
+        profile.id,
+      )).single['target_calendar_id'],
+      'family',
+    );
+    expect(
+      (await db.listMappingsForProfile(second.id)).single['target_calendar_id'],
+      'other-family',
+    );
+  });
+
+  test(
+    'five regular series occurrences produce five standalone mapped targets',
+    () async {
+      for (var index = 0; index < 5; index++) {
+        calendar.events['slot-$index'] = event(
+          'series',
+          instance: 'series@$index',
+          recurring: true,
+          from: start.add(Duration(days: index)),
+          until: end.add(Duration(days: index)),
+        );
+      }
+      expect((await sync()).synced, List.filled(5, 'series'));
+      final rows = await db.listMappingsForProfile(profile.id);
+      expect(rows.map((row) => row['source_instance_id']).toSet(), {
+        for (var i = 0; i < 5; i++) 'series@$i',
+      });
+      expect(rows.map((row) => row['target_event_id']).toSet(), hasLength(5));
+      expect(
+        calendar.events.values
+            .where((e) => e.calendarId == 'family')
+            .every((e) => !e.isRecurring),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'positive series deletion proposes all future slots but no calendar write',
+    () async {
+      for (var index = 0; index < 3; index++) {
+        calendar.events['target-$index'] = target('target-$index');
+        await map('series', 'target-$index', instance: 'series@$index');
+        calendar.changes[('series', 'series@$index')] = (
+          removed: true,
+          movedId: null,
+        );
+      }
+      final plan = await preview();
+      expect(plan.toDelete, hasLength(3));
+      expect((await sync()).deleted, isEmpty);
+      expect(calendar.deleted, isEmpty);
+      expect(await db.listMappingsForProfile(profile.id), hasLength(3));
+    },
+  );
+
+  test(
+    'privacy option transitions rewrite the same target in both directions',
+    () async {
+      calendar.events['match'] = event('match');
+      expect((await sync()).synced, ['match']);
+      expect((await sync(omitSourceTitle: true)).updated, ['match']);
+      expect(
+        calendar.events['created-1']!.description,
+        isNot(contains('Training')),
+      );
+      expect((await sync(omitSourceTitle: false)).updated, ['match']);
+      expect(calendar.events['created-1']!.description, contains('Training'));
+      expect(calendar.creates, 1);
+      expect(calendar.deleted, isEmpty);
+    },
+  );
+
+  test(
+    'a private-title change remains detectable when the visible title is fixed',
+    () async {
+      calendar.events['match'] = event('match');
+      expect((await sync(title: 'Busy', omitSourceTitle: true)).synced, [
+        'match',
+      ]);
+      final old = calendar.events['created-1']!.description;
+      calendar.events['match'] = event('match', title: 'Changed training');
+      expect((await sync(title: 'Busy', omitSourceTitle: true)).updated, [
+        'match',
+      ]);
+      expect(calendar.events['created-1']!.title, 'Busy');
+      expect(calendar.events['created-1']!.description, isNot(old));
+    },
+  );
+
+  test('a failed journal reservation cannot reach the provider', () async {
+    await removeSource();
+    final plan = await preview();
+    final raw = await db.database;
+    await raw.execute("""
+      CREATE TRIGGER fail_mutation_reserve BEFORE INSERT ON sync_target_mutations
+      BEGIN SELECT RAISE(ABORT, 'test failure'); END
+    """);
+    expect(await engine.deleteConfirmedTargets(plan.toDelete), isFalse);
+    expect(calendar.deleted, isEmpty);
+    expect(await db.hasPendingMutations(profile.id), isFalse);
+  });
+
+  test(
+    'an unknown update outcome leaves a visible barrier across reopen',
+    () async {
+      calendar.events['match'] = event('match', title: 'Changed');
+      calendar.events['target'] = target('target');
+      await map('match', 'target');
+      calendar.failAfterUpdate = true;
+      expect((await sync()).errors, isNotEmpty);
+      expect(calendar.updated, ['target']);
+      await (await db.database).close();
+      DatabaseProvider.setTestPath('${temp.path}/calendar.db');
+      db = MappingDatabase();
+      engine = SyncEngine(calendar, db);
+      expect(await db.hasPendingMutations(profile.id), isTrue);
+      expect((await preview()).errors.single, contains('unconfirmed'));
+      expect((await sync()).updated, isEmpty);
+      expect(calendar.updated, ['target']);
+      expect(calendar.creates, 0);
+    },
+  );
+
+  test(
+    'the provider runs outside SQLite and sees the committed mutation intent',
+    () async {
+      await removeSource();
+      final plan = await preview();
+      calendar.beforeDelete = () async {
+        expect(
+          await db
+              .hasPendingMutations(profile.id)
+              .timeout(const Duration(seconds: 2)),
+          isTrue,
+        );
+        await expectLater(profiles.deleteProfile(profile.id), throwsStateError);
+      };
+      expect(await engine.deleteConfirmedTargets(plan.toDelete), isTrue);
+      expect(await db.hasPendingMutations(profile.id), isFalse);
+    },
+  );
+
+  test(
+    'an actual failed SQLite commit retains deletion intent and frees the shared database',
+    () async {
+      await removeSource();
+      final plan = await preview();
+      final raw = await db.database;
+      await raw.execute(
+        'CREATE TABLE commit_guard_parent (id INTEGER PRIMARY KEY)',
+      );
+      await raw.execute("""
+      CREATE TABLE commit_guard (
+        id INTEGER REFERENCES commit_guard_parent(id) DEFERRABLE INITIALLY DEFERRED
+      )
+    """);
+      await raw.execute("""
+      CREATE TRIGGER fail_commit_after_mutation AFTER DELETE ON sync_target_mutations
+      BEGIN INSERT INTO commit_guard(id) VALUES (1); END
+    """);
+      expect(await engine.deleteConfirmedTargets(plan.toDelete), isFalse);
+      expect(calendar.deleted, ['target']);
+      final journal = await raw
+          .query('sync_target_mutations')
+          .timeout(const Duration(seconds: 2));
+      expect(journal.single['operation'], 'delete');
+      expect(journal.single['target_event_id'], 'target');
+      expect(await db.isEventSynced(profile.id, 'source', 'match'), isTrue);
+      expect((await preview()).errors.single, contains('unconfirmed'));
+      expect(await engine.deleteConfirmedTargets(plan.toDelete), isFalse);
+      expect(calendar.deleted, ['target']);
     },
   );
 

@@ -35,6 +35,12 @@ class SoftDeletePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         try {
             val value = when (call.method) {
+                "isFamilyTestBuild" -> FamilyTestCalendars.isTestBuild(context)
+                "familyTestCalendars" -> FamilyTestCalendars(context).ids()
+                "familyTestAllowsEventRead" -> FamilyTestCalendars(context).allowsEventRead(
+                    requireNotNull(call.argument<String>("eventId"))
+                )
+                "prepareFamilyTestCalendars" -> FamilyTestCalendars(context).prepare()
                 "sourceChange" -> sourceChange(call)
                 "sourceExceptionKeys" -> sourceExceptionKeys(call)
                 "canDeleteEvents" -> canDeleteEvents()
@@ -61,9 +67,12 @@ class SoftDeletePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     private fun sourceExceptionKeys(call: MethodCall): Map<String, List<String>> {
         val calendarId = requireNotNull(call.argument<String>("calendarId"))
+        FamilyTestCalendars(context).requireSource(calendarId)
         val ids = requireNotNull(call.argument<List<String>>("eventIds"))
         val result = mutableMapOf<String, List<String>>()
-        val projection = arrayOf(Events._ID, Events.ORIGINAL_ID, Events.ORIGINAL_INSTANCE_TIME)
+        val projection = arrayOf(
+            Events._ID, Events.ORIGINAL_ID, Events.ORIGINAL_INSTANCE_TIME, Events.ORIGINAL_SYNC_ID
+        )
         for (chunk in ids.chunked(250)) {
             val placeholders = chunk.joinToString(",") { "?" }
             val selection = "${Events.CALENDAR_ID} = ? AND ${Events._ID} IN ($placeholders)"
@@ -72,8 +81,14 @@ class SoftDeletePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             )).use { cursor ->
                 check(cursor.count == chunk.size)
                 while (cursor.moveToNext()) {
-                    if (cursor.isNull(1) || cursor.isNull(2)) continue
+                    val originalSyncId = cursor.getString(3)
                     val originalId = cursor.getString(1)
+                        ?: originalSyncId?.takeIf { it.isNotEmpty() }?.let { resolveOriginal(calendarId, it) }
+                    if (originalId == null && originalSyncId.isNullOrEmpty()) {
+                        check(cursor.isNull(2))
+                        continue
+                    }
+                    check(originalId != null && !cursor.isNull(2))
                     result[cursor.getString(0)] = listOf(originalId, "$originalId@${cursor.getLong(2)}")
                 }
             }
@@ -81,28 +96,43 @@ class SoftDeletePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         return result
     }
 
+    private fun resolveOriginal(calendarId: String, syncId: String): String? {
+        return checkNotNull(context.contentResolver.query(
+            Events.CONTENT_URI, arrayOf(Events._ID),
+            "${Events.CALENDAR_ID} = ? AND ${Events._SYNC_ID} = ?",
+            arrayOf(calendarId, syncId), null
+        )).use { cursor ->
+            if (cursor.count == 1 && cursor.moveToFirst()) cursor.getString(0) else null
+        }
+    }
+
     private fun sourceChange(call: MethodCall): Map<String, Any> {
         val calendarId = requireNotNull(call.argument<String>("calendarId"))
+        FamilyTestCalendars(context).requireSource(calendarId)
         val eventId = requireNotNull(call.argument<String>("eventId"))
         val instanceId = call.argument<String>("instanceId")
-        val projection = arrayOf(Events._ID, Events.DELETED, Events.STATUS)
+        val projection = arrayOf(Events._ID, Events.DELETED, Events.STATUS, Events._SYNC_ID)
         val resolver = context.contentResolver
         val master = checkNotNull(resolver.query(
             Events.CONTENT_URI, projection,
             "${Events.CALENDAR_ID} = ? AND ${Events._ID} = ?", arrayOf(calendarId, eventId), null
         )).use { cursor ->
             if (!cursor.moveToFirst()) return emptyMap()
-            cursor.getInt(1) != 0 || cursor.getInt(2) == Events.STATUS_CANCELED
+            Pair(cursor.getInt(1) != 0 || cursor.getInt(2) == Events.STATUS_CANCELED, cursor.getString(3))
         }
-        if (master) return mapOf("removed" to true)
+        if (master.first) return mapOf("removed" to true)
         if (instanceId == null) return emptyMap()
         val originalStart = instanceId.removePrefix("$eventId@").toLongOrNull() ?: return emptyMap()
         if (!instanceId.startsWith("$eventId@")) return emptyMap()
 
+        val syncId = master.second?.takeIf { it.isNotEmpty() }
+        val relation = if (syncId == null) "${Events.ORIGINAL_ID} = ?" else
+            "(${Events.ORIGINAL_ID} = ? OR (${Events.ORIGINAL_ID} IS NULL AND ${Events.ORIGINAL_SYNC_ID} = ?))"
+        val args = listOfNotNull(calendarId, eventId, syncId, originalStart.toString())
         return checkNotNull(resolver.query(
             Events.CONTENT_URI, projection,
-            "${Events.CALENDAR_ID} = ? AND ${Events.ORIGINAL_ID} = ? AND ${Events.ORIGINAL_INSTANCE_TIME} = ?",
-            arrayOf(calendarId, eventId, originalStart.toString()), null
+            "${Events.CALENDAR_ID} = ? AND $relation AND ${Events.ORIGINAL_INSTANCE_TIME} = ?",
+            args.toTypedArray(), null
         )).use { cursor ->
             // Absence (including hard deletes) is not proof of removal.
             if (cursor.count != 1 || !cursor.moveToFirst()) return@use emptyMap()
@@ -122,6 +152,8 @@ class SoftDeletePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     private fun mutateOwnedEvent(call: MethodCall, delete: Boolean): Boolean {
         if (delete && !canDeleteEvents()) return false
+        val calendarId = requireNotNull(call.argument<String>("calendarId"))
+        FamilyTestCalendars(context).requireTarget(calendarId)
         val allDay = requireNotNull(call.argument<Boolean>("oldAllDay"))
         val description = requireNotNull(call.argument<String>("oldDescription"))
         val location = call.argument<String>("oldLocation")
@@ -133,7 +165,7 @@ class SoftDeletePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             AND ${Events.ORIGINAL_ID} IS NULL AND COALESCE(${Events.ORIGINAL_SYNC_ID}, '') = ''""".trimIndent()
         val args = arrayOf(
             requireNotNull(call.argument<String>("eventId")),
-            requireNotNull(call.argument<String>("calendarId")),
+            calendarId,
             description,
             requireNotNull(call.argument<String>("oldTitle")),
             calendarMillis(number(call, "oldStart"), allDay).toString(),

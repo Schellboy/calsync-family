@@ -146,7 +146,10 @@ class ProfileService {
       final pending = await txn.query(
         'sync_creation_reservations', where: 'profile_id = ?', whereArgs: [id],
       );
-      if (pending.isNotEmpty) {
+      final mutations = await txn.query(
+        'sync_target_mutations', where: 'profile_id = ?', whereArgs: [id], limit: 1,
+      );
+      if (pending.isNotEmpty || mutations.isNotEmpty) {
         throw StateError('This profile has an unresolved calendar write.');
       }
       final mappings = await txn.query(

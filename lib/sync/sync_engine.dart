@@ -8,6 +8,18 @@ import 'mapping_database.dart';
 
 const _syncMarker = '\u{1F503} Automatically created by CalSync';
 
+String? _plainCalendarDescription(String? description) {
+  if (description == null) return null;
+  final wrapper = RegExp(
+    r'^<(p|div)>([\s\S]*)</\1>$',
+    caseSensitive: false,
+  ).firstMatch(description);
+  return wrapper
+          ?.group(2)
+          ?.replaceAll(RegExp(r'<br\s*/?>', caseSensitive: false), '\n') ??
+      description;
+}
+
 String buildDescription(
   String originalTitle,
   String? sourceDescription,
@@ -82,7 +94,7 @@ class ToCreateEntry {
 
   bool matches(Event target) =>
       projectedTitle == target.title &&
-      projectedDescription == target.description &&
+      projectedDescription == _plainCalendarDescription(target.description) &&
       (projectedLocation ?? '') == (target.location ?? '') &&
       projectedAllDay == target.isAllDay &&
       _sameDate(projectedStart, target.startDate) &&
@@ -127,6 +139,14 @@ class SyncEngine {
     bool omitSourceTitle = false,
   }) async {
     try {
+      if (await _mappingDb.hasPendingMutations(profileId)) {
+        return const SyncPlan(
+          errors: [
+            'An earlier calendar update or deletion is unconfirmed. '
+                'Review the target calendar before any further changes.',
+          ],
+        );
+      }
       if (sourceCalendarId == targetCalendarId) {
         throw StateError('Source and target must be different calendars.');
       }
@@ -363,7 +383,10 @@ class SyncEngine {
         throw StateError('The target calendar returned incomplete data.');
       }
       if (event.status != EventStatus.canceled &&
-          (event.description?.endsWith(_syncMarker) ?? false) &&
+          (_plainCalendarDescription(
+                event.description,
+              )?.endsWith(_syncMarker) ??
+              false) &&
           !await _mappingDb.isEventCreatedBySync(calendarId, event.eventId)) {
         candidates.add(event);
       }
@@ -380,7 +403,10 @@ class SyncEngine {
         target.instanceId != id ||
         target.isRecurring ||
         target.status == EventStatus.canceled ||
-        !(target.description?.endsWith(_syncMarker) ?? false) ||
+        !(_plainCalendarDescription(
+              target.description,
+            )?.endsWith(_syncMarker) ??
+            false) ||
         !await _mappingDb.ownsTarget(row)) {
       return null;
     }
@@ -395,7 +421,8 @@ class SyncEngine {
         'Calendar deletion requires permissions and an active connection.',
       );
     }
-    if (await _mappingDb.hasPendingCreations(profileId)) {
+    if (await _mappingDb.hasPendingCreations(profileId) ||
+        await _mappingDb.hasPendingMutations(profileId)) {
       throw StateError('This profile has an unresolved calendar write.');
     }
     final mappings = await _mappingDb.listMappingsForProfile(profileId);
@@ -421,6 +448,10 @@ class SyncEngine {
   }) async {
     try {
       if (!await _calendarService.canDeleteEvents()) return false;
+      for (final profileId
+          in targets.map((t) => t.mapping['profile_id'] as String).toSet()) {
+        if (await _mappingDb.hasPendingMutations(profileId)) return false;
+      }
       await _calendarService.verifyCalendars(null, {
         for (final target in targets) target.event.calendarId,
       });
@@ -518,7 +549,9 @@ class SyncEngine {
           if (!changed) throw StateError('Target changed during sync.');
           updated.add(projected.sourceEvent.eventId);
         } catch (_) {
-          errors.add('Could not update a mapped event. The mapping was kept.');
+          errors.add(
+            'Could not confirm a mapped event update. Check the target calendar.',
+          );
         }
       }
       for (final projected in plan.toCreate) {

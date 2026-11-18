@@ -12,6 +12,8 @@ import '../subscriptions/subscription_service.dart';
 void callbackDispatcher() {
   Workmanager().executeTask((taskName, inputData) async {
     try {
+      await CalendarService.initializeBuildMode();
+      if (CalendarService.isFamilyTestBuild) return true;
       final profileService = ProfileService();
       final profiles = await profileService.listEnabledProfiles();
 

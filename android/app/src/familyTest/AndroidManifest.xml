@@ -1,0 +1,13 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application
+        android:dataExtractionRules="@xml/family_test_no_transfer"
+        android:fullBackupContent="false">
+        <service
+            android:name="dev.henriquecouto.calsync.CalendarSyncJobService"
+            tools:node="remove" />
+        <receiver
+            android:name="dev.henriquecouto.calsync.BootReceiver"
+            tools:node="remove" />
+    </application>
+</manifest>

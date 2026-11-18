@@ -158,7 +158,7 @@ class _DryRunScreenState extends State<DryRunScreen> {
     setState(() {
       _plan = null;
       _loading = false;
-      _error = removed ? null : 'Deletion stopped. Run a new preview and check remaining targets.';
+      _error = removed ? null : 'Deletion stopped. Some events may already have been removed. Check the calendar and run a new preview.';
     });
     if (removed) await _runDryRun();
   }

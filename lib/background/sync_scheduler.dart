@@ -1,10 +1,12 @@
 import 'package:workmanager/workmanager.dart';
+import '../calendar/calendar_service.dart';
 import '../settings/profile_service.dart';
 import '../main.dart';
 import '../subscriptions/entitlement.dart';
 
 class SyncScheduler {
   static Future<void> updatePeriodicTask() async {
+    if (CalendarService.isFamilyTestBuild) return;
     final profileService = ProfileService();
     final allProfiles = await profileService.listProfiles();
     final profiles = allProfiles.asMap().entries

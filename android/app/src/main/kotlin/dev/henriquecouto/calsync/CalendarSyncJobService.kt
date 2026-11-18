@@ -76,6 +76,7 @@ class CalendarSyncJobService : JobService() {
 
     companion object {
         fun schedule(context: Context) {
+            if (FamilyTestCalendars.isTestBuild(context)) return
             val component = ComponentName(
                 context.packageName,
                 CalendarSyncJobService::class.java.name

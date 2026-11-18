@@ -5,21 +5,72 @@ class CalendarService {
   final DeviceCalendar _plugin = DeviceCalendar.instance;
   static const _channel = MethodChannel('calsync/calendar');
 
+  static bool isFamilyTestBuild = false;
+
+  static Future<void> initializeBuildMode() async {
+    isFamilyTestBuild =
+        await _channel.invokeMethod<bool>('isFamilyTestBuild') == true;
+  }
+
+  Future<Map<String, String>> familyTestCalendars() async =>
+      await _channel.invokeMapMethod<String, String>('familyTestCalendars') ??
+      {};
+
+  Future<void> prepareFamilyTestCalendars() async {
+    if (await _channel.invokeMethod<bool>('prepareFamilyTestCalendars') !=
+        true) {
+      throw StateError('Could not create isolated test calendars.');
+    }
+  }
+
   Future<List<Calendar>> listCalendars() async {
     try {
+      if (isFamilyTestBuild) {
+        final ids = await familyTestCalendars();
+        const labels = {
+          'sourceA': 'CalSync Family Test - Source A',
+          'sourceB': 'CalSync Family Test - Source B',
+          'target': 'CalSync Family Test - Target',
+        };
+        return [
+          for (final entry in ids.entries)
+            if (labels.containsKey(entry.key))
+              Calendar(
+                id: entry.value,
+                name: labels[entry.key]!,
+                readOnly: false,
+              ),
+        ];
+      }
       return await _plugin.listCalendars();
     } on DeviceCalendarException {
+      return [];
+    } on PlatformException {
       return [];
     }
   }
 
   Future<List<Event>> listEvents(String calendarId, {DateTime? end}) async {
+    if (isFamilyTestBuild &&
+        !(await familyTestCalendars()).containsValue(calendarId)) {
+      throw StateError('Only isolated test calendars can be queried.');
+    }
     final now = DateTime.now();
     final endDate = end ?? now.add(const Duration(days: 30));
     return _plugin.listEvents(now, endDate, calendarIds: [calendarId]);
   }
 
   Future<void> verifyCalendars(String? sourceId, Set<String> targetIds) async {
+    if (isFamilyTestBuild) {
+      final ids = await familyTestCalendars();
+      if ((sourceId != null &&
+              sourceId != ids['sourceA'] &&
+              sourceId != ids['sourceB']) ||
+          targetIds.any((id) => id != ids['target'])) {
+        throw StateError('Select an isolated test source and target calendar.');
+      }
+      return;
+    }
     final calendars = await _plugin.listCalendars();
     if ((sourceId != null && !calendars.any((c) => c.id == sourceId)) ||
         !targetIds.every(
@@ -77,6 +128,10 @@ class CalendarService {
     bool? isAllDay,
     String? location,
   }) async {
+    if (isFamilyTestBuild &&
+        (await familyTestCalendars())['target'] != calendarId) {
+      throw StateError('Only the isolated test target can receive events.');
+    }
     try {
       return await _plugin.createEvent(
         calendarId: calendarId,
@@ -93,6 +148,13 @@ class CalendarService {
   }
 
   Future<Event?> getEvent(String eventId) async {
+    if (isFamilyTestBuild &&
+        await _channel.invokeMethod<bool>('familyTestAllowsEventRead', {
+              'eventId': eventId,
+            }) !=
+            true) {
+      return null;
+    }
     return _plugin.getEvent(eventId);
   }
 
