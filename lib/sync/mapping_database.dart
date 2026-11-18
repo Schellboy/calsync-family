@@ -88,6 +88,171 @@ class MappingDatabase {
     );
   }
 
+  Future<bool> hasPendingCreations(String profileId) async {
+    final db = await database;
+    final rows = await db.query(
+      'sync_creation_reservations',
+      where: 'profile_id = ?',
+      whereArgs: [profileId],
+      limit: 1,
+    );
+    return rows.isNotEmpty;
+  }
+
+  Future<bool> ownsTarget(Map<String, Object?> mapping) async =>
+      _ownsTarget(await database, mapping);
+
+  Future<bool> _ownsTarget(
+    DatabaseExecutor executor,
+    Map<String, Object?> mapping,
+  ) async {
+    final rows = await executor.rawQuery(
+      """SELECT m.id, EXISTS (
+               SELECT 1 FROM sync_mappings duplicate
+               WHERE duplicate.id <> m.id AND duplicate.profile_id = m.profile_id
+                 AND duplicate.source_calendar_id = m.source_calendar_id
+                 AND duplicate.source_event_id = m.source_event_id
+                 AND duplicate.source_instance_id IS m.source_instance_id
+             ) AS has_duplicate_source
+           FROM sync_mappings m JOIN sync_created_events c
+           ON c.calendar_id = m.target_calendar_id AND c.event_id = m.target_event_id
+           WHERE m.target_calendar_id = ? AND m.target_event_id = ?""",
+      [mapping['target_calendar_id'], mapping['target_event_id']],
+    );
+    return rows.length == 1 &&
+        rows.single['id'] == mapping['id'] &&
+        rows.single['has_duplicate_source'] == 0;
+  }
+
+  Future<bool> reserveCreation(
+    String profileId,
+    String sourceCalendarId,
+    String sourceEventId,
+    String? instanceId,
+    String targetCalendarId,
+  ) async {
+    final db = await database;
+    return db.transaction((txn) async {
+      final profiles = await txn.query(
+        'sync_profiles',
+        where:
+            'id = ? AND source_calendar_id = ? AND target_calendar_id = ? AND enabled = 1',
+        whereArgs: [profileId, sourceCalendarId, targetCalendarId],
+      );
+      if (profiles.isEmpty) return false;
+      final key = [
+        profileId,
+        sourceCalendarId,
+        sourceEventId,
+        instanceId ?? '',
+      ];
+      final existing = await txn.query(
+        _tableName,
+        where:
+            "profile_id = ? AND source_calendar_id = ? AND source_event_id = ? AND COALESCE(source_instance_id, '') = ?",
+        whereArgs: key,
+      );
+      final pending = await txn.query(
+        'sync_creation_reservations',
+        where: _reservationKey,
+        whereArgs: key,
+      );
+      if (existing.isNotEmpty || pending.isNotEmpty) return false;
+      await txn.insert('sync_creation_reservations', {
+        'profile_id': profileId,
+        'source_calendar_id': sourceCalendarId,
+        'source_event_id': sourceEventId,
+        'source_instance_id': instanceId ?? '',
+      });
+      return true;
+    });
+  }
+
+  static const _reservationKey =
+      'profile_id = ? AND source_calendar_id = ? AND source_event_id = ? AND source_instance_id = ?';
+
+  Future<void> finishCreation({
+    required String profileId,
+    required String sourceCalendarId,
+    required String sourceEventId,
+    required String? sourceInstanceId,
+    required String targetCalendarId,
+    required String targetEventId,
+  }) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.insert(_tableName, {
+        _columnProfileId: profileId,
+        _columnSourceCalendarId: sourceCalendarId,
+        _columnSourceEventId: sourceEventId,
+        _columnSourceInstanceId: sourceInstanceId,
+        _columnTargetCalendarId: targetCalendarId,
+        _columnTargetEventId: targetEventId,
+        _columnSyncedAt: DateTime.now().toIso8601String(),
+      });
+      await txn.insert(_createdEventsTable, {
+        _ceCalendarId: targetCalendarId,
+        _ceEventId: targetEventId,
+      });
+      final count = await txn.delete(
+        'sync_creation_reservations',
+        where: _reservationKey,
+        whereArgs: [
+          profileId,
+          sourceCalendarId,
+          sourceEventId,
+          sourceInstanceId ?? '',
+        ],
+      );
+      if (count != 1) {
+        throw StateError('The calendar write has no reservation.');
+      }
+    });
+  }
+
+  Future<bool> changeOwnedTarget(
+    Map<String, Object?> mapping,
+    Future<bool> Function() change, {
+    bool removeMapping = false,
+    bool requireEnabledProfile = false,
+  }) async {
+    final db = await database;
+    return db.transaction((txn) async {
+      if (!await _ownsTarget(txn, mapping)) return false;
+      if (requireEnabledProfile) {
+        final active = await txn.query(
+          'sync_profiles',
+          where:
+              'id = ? AND source_calendar_id = ? AND target_calendar_id = ? AND enabled = 1',
+          whereArgs: [
+            mapping['profile_id'],
+            mapping['source_calendar_id'],
+            mapping['target_calendar_id'],
+          ],
+          limit: 1,
+        );
+        if (active.isEmpty) return false;
+      }
+      if (!await change()) return false;
+      if (removeMapping) {
+        await txn.delete(
+          _tableName,
+          where: 'id = ?',
+          whereArgs: [mapping['id']],
+        );
+        await txn.delete(
+          _createdEventsTable,
+          where: 'calendar_id = ? AND event_id = ?',
+          whereArgs: [
+            mapping['target_calendar_id'],
+            mapping['target_event_id'],
+          ],
+        );
+      }
+      return true;
+    });
+  }
+
   Future<List<Map<String, Object?>>> listMappingsForCalendar(
     String profileId,
     String sourceCalendarId,

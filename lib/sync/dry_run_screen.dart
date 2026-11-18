@@ -5,6 +5,7 @@ import '../settings/profile_service.dart';
 import '../widgets/sync_plan_card.dart';
 import '../widgets/section_header.dart';
 import '../widgets/empty_state.dart';
+import '../widgets/confirm_calendar_deletions.dart';
 import 'mapping_database.dart';
 import 'sync_engine.dart';
 
@@ -80,9 +81,11 @@ class _DryRunScreenState extends State<DryRunScreen> {
       syncEventName: syncName,
       syncWindowDays: profile.syncWindowDays,
       copyDescription: profile.copyDescription,
+      copyLocation: profile.copyLocation,
       omitSourceTitle: profile.omitSourceTitle,
     );
 
+    if (!mounted) return;
     setState(() {
       _plan = plan;
       _loading = false;
@@ -145,6 +148,21 @@ class _DryRunScreenState extends State<DryRunScreen> {
     );
   }
 
+  Future<void> _confirmDeletions(SyncPlan plan) async {
+    final confirmed = await confirmCalendarDeletions(context, plan.toDelete);
+    if (!mounted || !confirmed || !identical(_plan, plan)) return;
+    setState(() => _loading = true);
+    final removed = await SyncEngine(_calendarService, _mappingDb)
+        .deleteConfirmedTargets(plan.toDelete, verifySourceRemoval: true);
+    if (!mounted) return;
+    setState(() {
+      _plan = null;
+      _loading = false;
+      _error = removed ? null : 'Deletion stopped. Run a new preview and check remaining targets.';
+    });
+    if (removed) await _runDryRun();
+  }
+
   Widget _buildResults(ColorScheme colorScheme) {
     if (_plan == null) {
       return const EmptyState(
@@ -159,7 +177,8 @@ class _DryRunScreenState extends State<DryRunScreen> {
     final total = plan.toCreate.length +
         plan.toUpdate.length +
         plan.toSkip.length +
-        plan.toDelete.length;
+        plan.toDelete.length +
+        plan.unmappedCandidates.length;
 
     if (total == 0 && plan.errors.isEmpty) {
       return const EmptyState(
@@ -227,7 +246,7 @@ class _DryRunScreenState extends State<DryRunScreen> {
               type: SyncPlanEntryType.update,
               title: source.title,
               subtitle: timeStr,
-              detail: 'Target event would be replaced',
+              detail: 'The existing target event would be updated',
             );
           }),
           const SizedBox(height: 16),
@@ -249,22 +268,31 @@ class _DryRunScreenState extends State<DryRunScreen> {
           }),
           const SizedBox(height: 16),
         ],
+        if (plan.unmappedCandidates.isNotEmpty) ...[
+          const Text('Unmapped CalSync candidates. Review these in your calendar app.'),
+          ...plan.unmappedCandidates.map((event) => SyncPlanCard(
+            type: SyncPlanEntryType.skip,
+            title: event.title,
+            subtitle: _formatTimestamp(event.startDate),
+          )),
+        ],
         if (plan.toDelete.isNotEmpty) ...[
           SectionHeader(
             title: 'Would Delete',
             count: plan.toDelete.length,
             color: colorScheme.error,
           ),
-          ...plan.toDelete.map((mapping) {
-            final sourceEventId =
-                mapping['source_event_id'] as String? ?? '?';
-            return SyncPlanCard(
-              type: SyncPlanEntryType.delete,
-              title: 'Source event removed',
-              subtitle: 'Source ID: $sourceEventId',
-              detail: 'Target event would be deleted',
-            );
-          }),
+          ...plan.toDelete.map((target) => SyncPlanCard(
+            type: SyncPlanEntryType.delete,
+            title: target.event.title,
+            subtitle: _formatTimestamp(target.event.startDate),
+            detail: 'The source was verified as removed.',
+          )),
+          if (plan.errors.isEmpty)
+            OutlinedButton(
+              onPressed: () => _confirmDeletions(plan),
+              child: const Text('Review calendar deletions'),
+            ),
           const SizedBox(height: 16),
         ],
       ],

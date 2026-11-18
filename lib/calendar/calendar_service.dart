@@ -16,15 +16,56 @@ class CalendarService {
   Future<List<Event>> listEvents(String calendarId, {DateTime? end}) async {
     final now = DateTime.now();
     final endDate = end ?? now.add(const Duration(days: 30));
-    try {
-      return await _plugin.listEvents(
-        now,
-        endDate,
-        calendarIds: [calendarId],
-      );
-    } on DeviceCalendarException {
-      return [];
+    return _plugin.listEvents(now, endDate, calendarIds: [calendarId]);
+  }
+
+  Future<void> verifyCalendars(String? sourceId, Set<String> targetIds) async {
+    final calendars = await _plugin.listCalendars();
+    if ((sourceId != null && !calendars.any((c) => c.id == sourceId)) ||
+        !targetIds.every(
+          (id) => calendars.any((c) => c.id == id && !c.readOnly),
+        )) {
+      throw StateError('A required calendar is unavailable or read-only.');
     }
+  }
+
+  Future<bool> canDeleteEvents() async =>
+      await _channel.invokeMethod<bool>('canDeleteEvents') == true;
+
+  Future<Map<String, (String, String)>> sourceExceptionKeys(
+    String calendarId,
+    Set<String> eventIds,
+  ) async {
+    if (eventIds.isEmpty) return {};
+    final result = await _channel.invokeMapMethod<String, List<Object?>>(
+      'sourceExceptionKeys',
+      {'calendarId': calendarId, 'eventIds': eventIds.toList()},
+    );
+    if (result == null) {
+      throw StateError('The provider did not verify the source.');
+    }
+    return {
+      for (final entry in result.entries)
+        entry.key: (entry.value[0] as String, entry.value[1] as String),
+    };
+  }
+
+  Future<({bool removed, String? movedId})> sourceChange(
+    String calendarId,
+    String eventId,
+    String? instanceId,
+  ) async {
+    final result = await _channel.invokeMapMethod<String, Object?>(
+      'sourceChange',
+      {'calendarId': calendarId, 'eventId': eventId, 'instanceId': instanceId},
+    );
+    if (result == null) {
+      throw StateError('The provider did not verify the source.');
+    }
+    return (
+      removed: result['removed'] == true,
+      movedId: result['movedId'] as String?,
+    );
   }
 
   Future<String?> createEvent(
@@ -52,30 +93,44 @@ class CalendarService {
   }
 
   Future<Event?> getEvent(String eventId) async {
-    try {
-      return await _plugin.getEvent(eventId);
-    } on DeviceCalendarException {
-      return null;
-    }
+    return _plugin.getEvent(eventId);
   }
 
-  Future<CalendarDeleteResult> deleteEvent(String eventId) async {
-    try {
-      final ok = await _channel.invokeMethod<bool>(
-        'deleteEvent',
-        {'eventId': eventId},
-      );
-      return CalendarDeleteResult(success: ok == true);
-    } catch (_) {
-      return const CalendarDeleteResult(success: false);
-    }
-  }
-}
+  Future<bool> updateOwnedEvent(
+    Event expected, {
+    required String title,
+    required DateTime start,
+    required DateTime end,
+    required String description,
+    required bool allDay,
+    required String? location,
+  }) async =>
+      await _channel.invokeMethod<bool>('updateOwnedEvent', {
+        ..._snapshot(expected),
+        'title': title,
+        'start': start.millisecondsSinceEpoch,
+        'end': end.millisecondsSinceEpoch,
+        'description': description,
+        'allDay': allDay,
+        'location': location,
+      }) ==
+      true;
 
-class CalendarDeleteResult {
-  final bool success;
+  Future<bool> deleteOwnedEvent(Event expected) async =>
+      await _channel.invokeMethod<bool>(
+        'deleteOwnedEvent',
+        _snapshot(expected),
+      ) ==
+      true;
 
-  const CalendarDeleteResult({
-    required this.success,
-  });
+  Map<String, Object?> _snapshot(Event event) => {
+    'eventId': event.eventId,
+    'calendarId': event.calendarId,
+    'oldDescription': event.description,
+    'oldTitle': event.title,
+    'oldStart': event.startDate.millisecondsSinceEpoch,
+    'oldEnd': event.endDate.millisecondsSinceEpoch,
+    'oldAllDay': event.isAllDay,
+    'oldLocation': event.location,
+  };
 }

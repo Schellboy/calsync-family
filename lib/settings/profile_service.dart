@@ -142,34 +142,35 @@ class ProfileService {
 
   Future<void> deleteProfile(String id) async {
     final db = await database;
-    final mappings = await db.query(
-      'sync_mappings',
-      columns: ['target_calendar_id', 'target_event_id'],
-      where: 'profile_id = ?',
-      whereArgs: [id],
-    );
-    for (final m in mappings) {
-      await db.delete(
-        'sync_created_events',
-        where: 'calendar_id = ? AND event_id = ?',
-        whereArgs: [m['target_calendar_id'], m['target_event_id']],
+    await db.transaction((txn) async {
+      final pending = await txn.query(
+        'sync_creation_reservations', where: 'profile_id = ?', whereArgs: [id],
       );
-    }
-    await db.delete(
-      'sync_mappings',
-      where: 'profile_id = ?',
-      whereArgs: [id],
-    );
-    await db.delete(
-      'sync_status',
-      where: 'profile_id = ?',
-      whereArgs: [id],
-    );
-    await db.delete(
-      _tableName,
-      where: '$_columnId = ?',
-      whereArgs: [id],
-    );
+      if (pending.isNotEmpty) {
+        throw StateError('This profile has an unresolved calendar write.');
+      }
+      final mappings = await txn.query(
+        'sync_mappings',
+        columns: ['target_calendar_id', 'target_event_id'],
+        where: 'profile_id = ?',
+        whereArgs: [id],
+      );
+      for (final mapping in mappings) {
+        await txn.delete(
+          'sync_created_events',
+          where: '''calendar_id = ? AND event_id = ? AND NOT EXISTS
+            (SELECT 1 FROM sync_mappings WHERE target_calendar_id = ?
+              AND target_event_id = ? AND profile_id <> ?)''',
+          whereArgs: [
+            mapping['target_calendar_id'], mapping['target_event_id'],
+            mapping['target_calendar_id'], mapping['target_event_id'], id,
+          ],
+        );
+      }
+      await txn.delete('sync_mappings', where: 'profile_id = ?', whereArgs: [id]);
+      await txn.delete('sync_status', where: 'profile_id = ?', whereArgs: [id]);
+      await txn.delete(_tableName, where: '$_columnId = ?', whereArgs: [id]);
+    });
   }
 
   Future<SyncProfile?> getProfile(String id) async {

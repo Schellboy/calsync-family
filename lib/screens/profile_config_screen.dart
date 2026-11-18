@@ -4,6 +4,9 @@ import '../settings/profile_service.dart';
 import '../calendar/calendar_service.dart';
 import '../background/sync_scheduler.dart';
 import '../widgets/empty_state.dart';
+import '../widgets/confirm_calendar_deletions.dart';
+import '../sync/mapping_database.dart';
+import '../sync/sync_engine.dart';
 import '../main.dart';
 import 'upsell_bottom_sheet.dart';
 
@@ -241,36 +244,74 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
     );
   }
 
+  bool _deleting = false;
+
   Future<void> _delete() async {
-    if (_profileId == null) return;
-
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Delete profile'),
-        content: const Text(
-          'This will delete the profile and all its sync history and mappings. Target events already created will remain in the calendar.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
+    final profileId = _profileId;
+    if (profileId == null || _deleting) return;
+    setState(() => _deleting = true);
+    try {
+      final withCalendar = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Remove profile'),
+          content: const Text(
+            'Removing the profile erases its local settings, mappings and history. '
+            'You can keep its calendar events or review the mapped events before deleting them.',
           ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(context).colorScheme.error,
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Remove profile only'),
             ),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Review calendar events'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted || withCalendar == null) return;
 
-    if (confirmed == true) {
-      await _profileService.deleteProfile(_profileId!);
+      if (withCalendar) {
+        final mappingDb = MappingDatabase();
+        final engine = SyncEngine(_calendarService, mappingDb);
+        final targets = await engine.previewProfileDeletion(profileId);
+        if (!mounted) return;
+        final confirmed = await confirmCalendarDeletions(
+          context, targets, removeProfile: true,
+        );
+        if (!mounted || !confirmed) return;
+        final profile = await _profileService.getProfile(profileId);
+        if (profile == null) return;
+        await _profileService.updateProfile(profile.copyWith(enabled: false));
+        await SyncScheduler.updatePeriodicTask();
+        final current = await mappingDb.listMappingsForProfile(profileId);
+        if (await mappingDb.hasPendingCreations(profileId) ||
+            current.length != targets.length ||
+            !current.every((row) => targets.any((target) => target.mapping['id'] == row['id'])) ||
+            !await engine.deleteConfirmedTargets(targets)) {
+          throw StateError('Cleanup stopped. The profile is paused. Review the remaining target events.');
+        }
+      }
+      await _profileService.deleteProfile(profileId);
       await SyncScheduler.updatePeriodicTask();
       if (mounted) Navigator.pop(context, true);
+    } on StateError catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.message)),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not complete profile removal. Check the profile and try again.')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _deleting = false);
     }
   }
 
@@ -576,7 +617,7 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
                   ),
                   const SizedBox(height: 24),
                   FilledButton.icon(
-                    onPressed: _save,
+                    onPressed: _deleting ? null : _save,
                     icon: const Icon(Icons.save),
                     label: Text(_isEditing ? 'Save Changes' : 'Create Profile'),
                   ),
@@ -593,7 +634,7 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
                     ),
                     const SizedBox(height: 12),
                     OutlinedButton.icon(
-                      onPressed: _delete,
+                      onPressed: _deleting ? null : _delete,
                       icon: const Icon(Icons.delete),
                       label: const Text('Delete Profile'),
                       style: OutlinedButton.styleFrom(
