@@ -35,6 +35,7 @@ class _DashboardScreenState extends State<DashboardScreen>
   List<SyncProfile> _profiles = [];
   Map<String, String> _calendarNames = {};
   List<Map<String, Object?>> _recentHistory = [];
+  List<String> _profilesWithPendingWrites = [];
   bool _loading = true;
 
   @override
@@ -68,11 +69,17 @@ class _DashboardScreenState extends State<DashboardScreen>
     }
 
     final history = await _mappingDb.getStatusHistory(limit: 3);
+    final pendingProfileIds = await _mappingDb.profilesWithPendingCalendarWrites();
+    if (!mounted) return;
 
     setState(() {
       _profiles = profiles;
       _calendarNames = calendarNames;
       _recentHistory = history;
+      _profilesWithPendingWrites = [
+        for (final profile in profiles)
+          if (pendingProfileIds.contains(profile.id)) profile.name,
+      ];
       _loading = false;
     });
   }
@@ -286,6 +293,17 @@ class _DashboardScreenState extends State<DashboardScreen>
               ),
             ),
           ),
+          if (_profilesWithPendingWrites.isNotEmpty)
+            Card(
+              child: ListTile(
+                leading: const Icon(Icons.warning_amber),
+                title: const Text('Unconfirmed calendar changes'),
+                subtitle: Text(
+                  'Check the target calendars before retrying these profiles: '
+                  '${_profilesWithPendingWrites.join(', ')}',
+                ),
+              ),
+            ),
           if (_recentHistory.isNotEmpty) ...[
             const SizedBox(height: 16),
             Card(

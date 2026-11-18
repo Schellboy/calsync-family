@@ -4,6 +4,9 @@ import '../settings/profile_service.dart';
 import '../calendar/calendar_service.dart';
 import '../background/sync_scheduler.dart';
 import '../widgets/empty_state.dart';
+import '../widgets/confirm_calendar_deletions.dart';
+import '../sync/mapping_database.dart';
+import '../sync/sync_engine.dart';
 import '../main.dart';
 import 'upsell_bottom_sheet.dart';
 
@@ -46,7 +49,8 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
   String? _targetCalendarId;
   int _intervalMinutes = 60;
   int _syncWindowDays = 30;
-  bool _syncEnabled = true;
+  bool _syncEnabled = !CalendarService.isFamilyTestBuild;
+  String? _testTargetId;
   bool _copyDescription = false;
   bool _copyLocation = false;
   bool _omitSourceTitle = false;
@@ -85,6 +89,9 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
 
   Future<void> _load() async {
     final calendars = await _calendarService.listCalendars();
+    if (CalendarService.isFamilyTestBuild && calendars.isNotEmpty) {
+      _testTargetId = (await _calendarService.familyTestCalendars())['target'];
+    }
 
     if (_isEditing) {
       final profiles = await _profileService.listProfiles();
@@ -105,6 +112,7 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
       }
     }
 
+    if (!mounted) return;
     setState(() {
       _isCreateMode = !_isEditing;
       _calendars = calendars
@@ -117,6 +125,20 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
           .toList();
       _loading = false;
     });
+  }
+
+  Future<void> _prepareTestCalendars() async {
+    setState(() => _loading = true);
+    try {
+      await _calendarService.prepareFamilyTestCalendars();
+      await _load();
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _loading = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('The device could not create isolated test calendars.')),
+      );
+    }
   }
 
   String? _validate() {
@@ -204,7 +226,7 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
           sourceCalendarId: _sourceCalendarId,
           targetCalendarId: _targetCalendarId,
           eventName: eventName,
-          intervalMinutes: _intervalMinutes,
+          intervalMinutes: CalendarService.isFamilyTestBuild ? 0 : _intervalMinutes,
           syncWindowDays: _syncWindowDays,
           enabled: _enableRestricted ? false : _syncEnabled,
           copyDescription: _copyDescription,
@@ -218,7 +240,7 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
         sourceCalendarId: _sourceCalendarId,
         targetCalendarId: _targetCalendarId,
         eventName: eventName,
-        intervalMinutes: _intervalMinutes,
+        intervalMinutes: CalendarService.isFamilyTestBuild ? 0 : _intervalMinutes,
         syncWindowDays: _syncWindowDays,
         enabled: _syncEnabled,
         copyDescription: _copyDescription,
@@ -241,36 +263,74 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
     );
   }
 
+  bool _deleting = false;
+
   Future<void> _delete() async {
-    if (_profileId == null) return;
-
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Delete profile'),
-        content: const Text(
-          'This will delete the profile and all its sync history and mappings. Target events already created will remain in the calendar.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
+    final profileId = _profileId;
+    if (profileId == null || _deleting) return;
+    setState(() => _deleting = true);
+    try {
+      final withCalendar = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Remove profile'),
+          content: const Text(
+            'Removing the profile erases its local settings, mappings and history. '
+            'You can keep its calendar events or review the mapped events before deleting them.',
           ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(context).colorScheme.error,
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Remove profile only'),
             ),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Review calendar events'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted || withCalendar == null) return;
 
-    if (confirmed == true) {
-      await _profileService.deleteProfile(_profileId!);
+      if (withCalendar) {
+        final mappingDb = MappingDatabase();
+        final engine = SyncEngine(_calendarService, mappingDb);
+        final targets = await engine.previewProfileDeletion(profileId);
+        if (!mounted) return;
+        final confirmed = await confirmCalendarDeletions(
+          context, targets, removeProfile: true,
+        );
+        if (!mounted || !confirmed) return;
+        final profile = await _profileService.getProfile(profileId);
+        if (profile == null) return;
+        await _profileService.updateProfile(profile.copyWith(enabled: false));
+        await SyncScheduler.updatePeriodicTask();
+        final current = await mappingDb.listMappingsForProfile(profileId);
+        if (await mappingDb.hasPendingCreations(profileId) ||
+            current.length != targets.length ||
+            !current.every((row) => targets.any((target) => target.mapping['id'] == row['id'])) ||
+            !await engine.deleteConfirmedTargets(targets)) {
+          throw StateError('Cleanup stopped and the profile is paused. Some events may already have been removed. Check the target calendar.');
+        }
+      }
+      await _profileService.deleteProfile(profileId);
       await SyncScheduler.updatePeriodicTask();
       if (mounted) Navigator.pop(context, true);
+    } on StateError catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.message)),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not complete profile removal. Check the profile and try again.')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _deleting = false);
     }
   }
 
@@ -354,6 +414,13 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
                             },
                           ),
                           const SizedBox(height: 16),
+                          if (CalendarService.isFamilyTestBuild) ...[
+                            const Text('Manual sync only. The test app uses three isolated local calendars.'),
+                            OutlinedButton(
+                              onPressed: _prepareTestCalendars,
+                              child: const Text('Prepare isolated test calendars'),
+                            ),
+                          ],
                           if (_calendars.isEmpty)
                             const EmptyState(
                               icon: Icons.calendar_month,
@@ -366,7 +433,8 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
                               errorText: _pairingError,
                               expandedInsets: EdgeInsets.zero,
                               menuHeight: 320,
-                              dropdownMenuEntries: _calendars.map((c) {
+                              dropdownMenuEntries: _calendars.where((c) =>
+                                !CalendarService.isFamilyTestBuild || c.id != _testTargetId).map((c) {
                                 return DropdownMenuEntry(
                                     value: c.id, label: c.displayName);
                               }).toList(),
@@ -386,7 +454,8 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
                               errorText: _pairingError,
                               expandedInsets: EdgeInsets.zero,
                               menuHeight: 320,
-                              dropdownMenuEntries: _calendars.map((c) {
+                              dropdownMenuEntries: _calendars.where((c) =>
+                                !CalendarService.isFamilyTestBuild || c.id == _testTargetId).map((c) {
                                 return DropdownMenuEntry(
                                   value: c.id,
                                   label: c.readOnly
@@ -461,37 +530,39 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
                           ),
                         ),
                         const SizedBox(height: 16),
-                        DropdownMenu<int>(
-                          initialSelection: _intervalMinutes,
-                          label: const Text('Fallback Interval'),
-                          expandedInsets: EdgeInsets.zero,
-                          menuHeight: 240,
-                          dropdownMenuEntries: const [
-                            DropdownMenuEntry(
-                                value: 0, label: 'Off (manual only)'),
-                            DropdownMenuEntry(
-                                value: 15, label: '15 minutes'),
-                            DropdownMenuEntry(
-                                value: 30, label: '30 minutes'),
-                            DropdownMenuEntry(value: 60, label: '1 hour'),
-                            DropdownMenuEntry(value: 120, label: '2 hours'),
-                            DropdownMenuEntry(value: 360, label: '6 hours'),
-                          ],
-                          onSelected: (val) {
-                            if (val != null) {
-                              setState(() => _intervalMinutes = val);
-                            }
-                          },
-                        ),
-                        const SizedBox(height: 8),
-                        Align(
-                          alignment: Alignment.centerLeft,
-                          child: Text(
-                            'Changes are detected within seconds. '
-                            'The interval above is a fallback only.',
-                            style: hintStyle,
+                        if (!CalendarService.isFamilyTestBuild) ...[
+                          DropdownMenu<int>(
+                            initialSelection: _intervalMinutes,
+                            label: const Text('Fallback Interval'),
+                            expandedInsets: EdgeInsets.zero,
+                            menuHeight: 240,
+                            dropdownMenuEntries: const [
+                              DropdownMenuEntry(
+                                  value: 0, label: 'Off (manual only)'),
+                              DropdownMenuEntry(
+                                  value: 15, label: '15 minutes'),
+                              DropdownMenuEntry(
+                                  value: 30, label: '30 minutes'),
+                              DropdownMenuEntry(value: 60, label: '1 hour'),
+                              DropdownMenuEntry(value: 120, label: '2 hours'),
+                              DropdownMenuEntry(value: 360, label: '6 hours'),
+                            ],
+                            onSelected: (val) {
+                              if (val != null) {
+                                setState(() => _intervalMinutes = val);
+                              }
+                            },
                           ),
-                        ),
+                          const SizedBox(height: 8),
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              'Changes are detected within seconds. '
+                              'The interval above is a fallback only.',
+                              style: hintStyle,
+                            ),
+                          ),
+                        ],
                         const SizedBox(height: 16),
                         DropdownMenu<int>(
                           initialSelection: _syncWindowDays,
@@ -576,7 +647,7 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
                   ),
                   const SizedBox(height: 24),
                   FilledButton.icon(
-                    onPressed: _save,
+                    onPressed: _deleting ? null : _save,
                     icon: const Icon(Icons.save),
                     label: Text(_isEditing ? 'Save Changes' : 'Create Profile'),
                   ),
@@ -593,7 +664,7 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
                     ),
                     const SizedBox(height: 12),
                     OutlinedButton.icon(
-                      onPressed: _delete,
+                      onPressed: _deleting ? null : _delete,
                       icon: const Icon(Icons.delete),
                       label: const Text('Delete Profile'),
                       style: OutlinedButton.styleFrom(

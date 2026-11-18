@@ -1,0 +1,65 @@
+name: Build isolated Family test APK
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-family-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.47.0'
+
+      - name: Install dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Analyze
+        run: flutter analyze --no-pub
+
+      - name: Run tests
+        run: flutter test --no-pub
+
+      - name: Build isolated debug APK
+        run: flutter build apk --debug --flavor familyTest --no-pub
+
+      - name: Verify test identity and backup isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=build/app/outputs/flutter-apk/app-familytest-debug.apk
+          tools="$ANDROID_HOME/build-tools/36.0.0"
+          "$tools/aapt2" dump badging "$apk" > "$RUNNER_TEMP/family-test-badging"
+          grep -F "package: name='de.schellboy.calsyncfamily.test'" "$RUNNER_TEMP/family-test-badging"
+          grep -Fx "application-label:'CalSync Family Test'" "$RUNNER_TEMP/family-test-badging"
+          "$tools/aapt2" dump xmltree --file AndroidManifest.xml "$apk" > "$RUNNER_TEMP/family-test-manifest"
+          grep -E 'android:allowBackup.*=false' "$RUNNER_TEMP/family-test-manifest"
+          if grep -Eq 'CalSyncJobService|CalendarSyncJobService|calsync.BootReceiver' "$RUNNER_TEMP/family-test-manifest"; then
+            echo "::error::The test APK contains an automatic sync component."
+            exit 1
+          fi
+          "$tools/apksigner" verify "$apk"
+
+      - name: Upload isolated test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CalSync-Family-Isolated-Test-APK
+          path: build/app/outputs/flutter-apk/app-familytest-debug.apk
+          if-no-files-found: error

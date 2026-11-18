@@ -1,2425 +1,1148 @@
+import 'dart:io';
+
 import 'package:calendar_sync/calendar/calendar_service.dart';
+import 'package:calendar_sync/settings/profile_service.dart';
+import 'package:calendar_sync/sync/database_provider.dart';
 import 'package:calendar_sync/sync/mapping_database.dart';
 import 'package:calendar_sync/sync/sync_engine.dart';
-import 'package:crypto/crypto.dart';
 import 'package:device_calendar_plus/device_calendar_plus.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:mocktail/mocktail.dart';
 
-class MockCalendarService extends Mock implements CalendarService {}
+import 'test_helpers.dart';
 
-class MockMappingDatabase extends Mock implements MappingDatabase {}
+final start = DateTime.now().add(const Duration(days: 2));
+final end = start.add(const Duration(hours: 2));
 
-Event _makeEvent(String id, {required DateTime end, DateTime? start}) {
-  final s = start ?? end.subtract(const Duration(hours: 1));
-  return Event(
-    eventId: id,
-    instanceId: id,
-    calendarId: 'cal-1',
-    title: 'Test Event',
-    startDate: s,
-    endDate: end,
-    isAllDay: false,
-    availability: EventAvailability.busy,
-    status: EventStatus.none,
-    isRecurring: false,
-  );
-}
+Event event(
+  String id, {
+  String calendar = 'source',
+  String? instance,
+  String title = 'Training',
+  String? description,
+  String? location,
+  DateTime? from,
+  DateTime? until,
+  bool allDay = false,
+  bool recurring = false,
+  EventStatus status = EventStatus.confirmed,
+}) => Event(
+  eventId: id,
+  instanceId: instance ?? id,
+  calendarId: calendar,
+  title: title,
+  description: description,
+  location: location,
+  startDate: from ?? start,
+  endDate: until ?? end,
+  isAllDay: allDay,
+  isRecurring: recurring,
+  status: status,
+  availability: EventAvailability.busy,
+);
 
-Event _allDayEvent(String id, DateTime start, DateTime end) {
-  return Event(
-    eventId: id,
-    instanceId: id,
-    calendarId: 'cal-1',
-    title: 'All Day Test',
-    startDate: start,
-    endDate: end,
-    isAllDay: true,
-    availability: EventAvailability.busy,
-    status: EventStatus.none,
-    isRecurring: false,
-  );
+const marker = '🔃 Automatically created by CalSync';
+
+class TestCalendar extends CalendarService {
+  final events = <String, Event>{};
+  final exceptionKeys = <String, (String, String)>{};
+  final changes = <(String, String?), ({bool removed, String? movedId})>{};
+  final unavailableCalendars = <String>{};
+  final failedReads = <String>{};
+  final deleted = <String>[];
+  final updated = <String>[];
+  bool offline = false;
+  bool permissionDenied = false;
+  bool rejectUpdate = false;
+  bool failAfterUpdate = false;
+  Future<void> Function()? beforeDelete;
+  bool rejectDelete = false;
+  bool failAfterCreate = false;
+  Future<void> Function()? afterCreate;
+  int creates = 0;
+
+  @override
+  Future<void> verifyCalendars(String? sourceId, Set<String> targetIds) async {
+    if (permissionDenied ||
+        unavailableCalendars.contains(sourceId) ||
+        unavailableCalendars.intersection(targetIds).isNotEmpty) {
+      throw StateError('calendar not available');
+    }
+  }
+
+  @override
+  Future<List<Event>> listEvents(String calendarId, {DateTime? end}) async {
+    if (failedReads.contains(calendarId)) throw StateError('list failed');
+    return events.values
+        .where(
+          (event) =>
+              event.calendarId == calendarId &&
+              event.endDate.isAfter(DateTime.now()) &&
+              (end == null || event.startDate.isBefore(end)),
+        )
+        .toList();
+  }
+
+  @override
+  Future<Event?> getEvent(String eventId) async {
+    if (failedReads.contains(eventId)) throw StateError('lookup failed');
+    return events[eventId];
+  }
+
+  @override
+  Future<bool> canDeleteEvents() async => !offline && !permissionDenied;
+
+  @override
+  Future<Map<String, (String, String)>> sourceExceptionKeys(
+    String calendarId,
+    Set<String> eventIds,
+  ) async => {
+    for (final id in eventIds)
+      if (exceptionKeys.containsKey(id)) id: exceptionKeys[id]!,
+  };
+
+  @override
+  Future<({bool removed, String? movedId})> sourceChange(
+    String calendarId,
+    String eventId,
+    String? instanceId,
+  ) async {
+    if (failedReads.contains(eventId)) throw StateError('source read failed');
+    return changes[(eventId, instanceId)] ?? (removed: false, movedId: null);
+  }
+
+  @override
+  Future<String?> createEvent(
+    String calendarId,
+    String title,
+    DateTime start,
+    DateTime end, {
+    String? description,
+    bool? isAllDay,
+    String? location,
+  }) async {
+    final id = 'created-${++creates}';
+    events[id] = event(
+      id,
+      calendar: calendarId,
+      title: title,
+      description: description,
+      from: start,
+      until: end,
+      allDay: isAllDay ?? false,
+      location: location,
+    );
+    await afterCreate?.call();
+    if (failAfterCreate) throw StateError('response lost');
+    return id;
+  }
+
+  @override
+  Future<bool> updateOwnedEvent(
+    Event expected, {
+    required String title,
+    required DateTime start,
+    required DateTime end,
+    required String description,
+    required bool allDay,
+    required String? location,
+  }) async {
+    if (rejectUpdate || !identical(events[expected.eventId], expected)) {
+      return false;
+    }
+    updated.add(expected.eventId);
+    events[expected.eventId] = event(
+      expected.eventId,
+      calendar: expected.calendarId,
+      from: start,
+      until: end,
+      title: title,
+      description: description,
+      allDay: allDay,
+      location: location,
+    );
+    if (failAfterUpdate) throw StateError('response lost');
+    return true;
+  }
+
+  @override
+  Future<bool> deleteOwnedEvent(Event expected) async {
+    await beforeDelete?.call();
+    if (rejectDelete ||
+        !await canDeleteEvents() ||
+        !identical(events[expected.eventId], expected)) {
+      return false;
+    }
+    events.remove(expected.eventId);
+    deleted.add(expected.eventId);
+    return true;
+  }
 }
 
 void main() {
-  late MockCalendarService calendarService;
-  late MockMappingDatabase mappingDb;
+  late Directory temp;
+  late TestCalendar calendar;
+  late MappingDatabase db;
+  late ProfileService profiles;
   late SyncEngine engine;
+  late SyncProfile profile;
 
-  final sourceCalId = 'src-cal';
-  final targetCalId = 'tgt-cal';
-  final syncName = 'Busy';
-  final profileId = 'test-profile';
+  Future<SyncProfile> addProfile(String name, String source) =>
+      profiles.createProfile(
+        name: name,
+        sourceCalendarId: source,
+        targetCalendarId: 'family',
+        eventName: '',
+        intervalMinutes: 60,
+        enabled: true,
+      );
 
-  final futureEnd = DateTime.utc(2027, 1, 1);
-  final oldEnd = DateTime.utc(2020, 1, 1);
-
-  setUp(() {
-    calendarService = MockCalendarService();
-    mappingDb = MockMappingDatabase();
-    engine = SyncEngine(calendarService, mappingDb);
+  setUp(() async {
+    initTestDb();
+    temp = await Directory.systemTemp.createTemp('calsync-engine-');
+    DatabaseProvider.setTestPath('${temp.path}/calendar.db');
+    calendar = TestCalendar();
+    db = MappingDatabase();
+    profiles = ProfileService();
+    engine = SyncEngine(calendar, db);
+    profile = await addProfile('First team', 'source');
   });
 
-  group('Deletion pass 7-day threshold + source-by-ID', () {
-    test('old past event (target.end < now-7d) -> skipped, no source fetch', () async {
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [
-          {
-            'id': 1,
-            'source_event_id': 'src-1',
-            'target_event_id': 'tgt-1',
-            'target_calendar_id': targetCalId,
-          },
-        ],
-      );
-
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => _makeEvent('tgt-1', end: oldEnd, start: oldEnd.subtract(const Duration(hours: 1))),
-      );
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toDelete, isEmpty);
-    });
-
-    test('recent event with source exists -> re-classified, not deleted', () async {
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [
-          {
-            'id': 1,
-            'source_event_id': 'src-1',
-            'target_event_id': 'tgt-1',
-            'target_calendar_id': targetCalId,
-          },
-        ],
-      );
-
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => Event(
-          eventId: 'tgt-1',
-          instanceId: 'tgt-1',
-          calendarId: targetCalId,
-          title: 'Busy',
-          description: 'Test Event\n---\n🔃 Automatically created by CalSync',
-          startDate: futureEnd.subtract(const Duration(hours: 1)),
-          endDate: futureEnd,
-          isAllDay: false,
-          availability: EventAvailability.busy,
-          status: EventStatus.none,
-          isRecurring: false,
-        ),
-      );
-
-      when(() => calendarService.getEvent('src-1')).thenAnswer(
-        (_) async => _makeEvent('src-1', end: futureEnd,
-            start: futureEnd.subtract(const Duration(hours: 1))),
-      );
-
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toDelete, isEmpty);
-      verify(() => calendarService.getEvent('src-1')).called(1);
-    });
-
-    test('recent event with source gone -> deleted', () async {
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [
-          {
-            'id': 1,
-            'source_event_id': 'src-1',
-            'target_event_id': 'tgt-1',
-            'target_calendar_id': targetCalId,
-          },
-        ],
-      );
-
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => _makeEvent('tgt-1', end: futureEnd,
-            start: futureEnd.subtract(const Duration(hours: 1))),
-      );
-
-      when(() => calendarService.getEvent('src-1'))
-          .thenAnswer((_) async => null);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toDelete, hasLength(1));
-      expect(plan.toDelete.first['source_event_id'], 'src-1');
-      verify(() => calendarService.getEvent('src-1')).called(1);
-    });
-
-    test('recent event source found -> re-classified (skip when unchanged)', () async {
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [
-          {
-            'id': 1,
-            'source_event_id': 'src-1',
-            'target_event_id': 'tgt-1',
-            'target_calendar_id': targetCalId,
-          },
-        ],
-      );
-
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => Event(
-          eventId: 'tgt-1',
-          instanceId: 'tgt-1',
-          calendarId: targetCalId,
-          title: 'Busy',
-          description: 'Test Event\n---\n🔃 Automatically created by CalSync',
-          startDate: futureEnd.subtract(const Duration(hours: 1)),
-          endDate: futureEnd,
-          isAllDay: false,
-          availability: EventAvailability.busy,
-          status: EventStatus.none,
-          isRecurring: false,
-        ),
-      );
-
-      when(() => calendarService.getEvent('src-1')).thenAnswer(
-        (_) async => _makeEvent('src-1', end: futureEnd,
-            start: futureEnd.subtract(const Duration(hours: 1))),
-      );
-
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toDelete, isEmpty);
-      expect(plan.toUpdate, isEmpty);
-      expect(plan.toSkip.any((e) => e.eventId == 'src-1'), isTrue);
-      verify(() => calendarService.getEvent('src-1')).called(1);
-    });
-
-    test('recent event source found with changed time -> classified as toUpdate', () async {
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [
-          {
-            'id': 1,
-            'source_event_id': 'src-1',
-            'target_event_id': 'tgt-1',
-            'target_calendar_id': targetCalId,
-          },
-        ],
-      );
-
-      final changedStart = futureEnd.subtract(const Duration(hours: 2));
-
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => Event(
-          eventId: 'tgt-1',
-          instanceId: 'tgt-1',
-          calendarId: targetCalId,
-          title: 'Busy',
-          description: 'Test Event\n---\n🔃 Automatically created by CalSync',
-          startDate: futureEnd.subtract(const Duration(hours: 1)),
-          endDate: futureEnd,
-          isAllDay: false,
-          availability: EventAvailability.busy,
-          status: EventStatus.none,
-          isRecurring: false,
-        ),
-      );
-
-      when(() => calendarService.getEvent('src-1')).thenAnswer(
-        (_) async => _makeEvent('src-1', end: futureEnd, start: changedStart),
-      );
-
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toDelete, isEmpty);
-      expect(plan.toUpdate, hasLength(1));
-      expect(plan.toUpdate.first.sourceEvent.eventId, 'src-1');
-      verify(() => calendarService.getEvent('src-1')).called(1);
-    });
+  tearDown(() async {
+    await (await db.database).close();
+    await temp.delete(recursive: true);
   });
 
-  group('Null safety for target event times', () {
-    test('target event not found is skipped without crashing', () async {
-      final srcEvent = _makeEvent('src-1',
-          end: futureEnd, start: futureEnd.subtract(const Duration(hours: 1)));
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [
-          {
-            'id': 1,
-            'source_event_id': 'src-1',
-            'target_event_id': 'tgt-1',
-            'target_calendar_id': targetCalId,
-          },
-        ],
-      );
-
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-
-      when(() => calendarService.getEvent('tgt-1'))
-          .thenAnswer((_) async => null);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toSkip.any((e) => e.eventId == 'src-1'), isTrue);
-    });
-  });
-
-  group('All-day event sync', () {
-    final day1 = DateTime.utc(2026, 6, 23);
-    final day3 = DateTime.utc(2026, 6, 25);
-
-    test('single-day all-day source creates all-day target with same dates', () async {
-      final srcStart = day1;
-      final srcEnd = day1.add(const Duration(days: 1));
-      final srcEvent = _allDayEvent('src-1', srcStart, srcEnd);
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toCreate, hasLength(1));
-      final entry = plan.toCreate.first;
-      expect(entry.projectedAllDay, true);
-      expect(entry.projectedStart, srcStart);
-      expect(entry.projectedEnd, srcEnd);
-    });
-
-    test('multi-day all-day source creates all-day target with same dates', () async {
-      final srcEnd = day3.add(const Duration(days: 1));
-      final srcEvent = _allDayEvent('src-1', day1, srcEnd);
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toCreate, hasLength(1));
-      final entry = plan.toCreate.first;
-      expect(entry.projectedAllDay, true);
-      expect(entry.projectedStart, day1);
-      expect(entry.projectedEnd, srcEnd);
-    });
-
-    test('all-day change detection: skip when dates match', () async {
-      final srcStart = day1;
-      final srcEnd = day1.add(const Duration(days: 1));
-      final srcEvent = _allDayEvent('src-1', srcStart, srcEnd);
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [
-          {
-            'id': 1,
-            'source_event_id': 'src-1',
-            'target_event_id': 'tgt-1',
-            'target_calendar_id': targetCalId,
-          },
-        ],
-      );
-
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => Event(
-          eventId: 'tgt-1',
-          instanceId: 'tgt-1',
-          calendarId: targetCalId,
-          title: 'All Day Test',
-          description: 'All Day Test',
-          startDate: srcStart,
-          endDate: srcEnd,
-          isAllDay: true,
-          availability: EventAvailability.busy,
-          status: EventStatus.none,
-          isRecurring: false,
-        ),
-      );
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toUpdate, isEmpty);
-      expect(plan.toSkip.any((e) => e.eventId == 'src-1'), isTrue);
-    });
-
-    test('all-day change detection: update when date changes', () async {
-      final srcStart = day3;
-      final srcEnd = day3.add(const Duration(days: 1));
-      final srcEvent = _allDayEvent('src-1', srcStart, srcEnd);
-      final tgtStart = day1;
-      final tgtEnd = day1.add(const Duration(days: 1));
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [
-          {
-            'id': 1,
-            'source_event_id': 'src-1',
-            'target_event_id': 'tgt-1',
-            'target_calendar_id': targetCalId,
-          },
-        ],
-      );
-
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => Event(
-          eventId: 'tgt-1',
-          instanceId: 'tgt-1',
-          calendarId: targetCalId,
-          title: 'All Day Test',
-          description: 'All Day Test',
-          startDate: tgtStart,
-          endDate: tgtEnd,
-          isAllDay: true,
-          availability: EventAvailability.busy,
-          status: EventStatus.none,
-          isRecurring: false,
-        ),
-      );
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toUpdate, hasLength(1));
-      expect(plan.toUpdate.first.sourceEvent.eventId, 'src-1');
-    });
-
-    test('timed source event is copied as-is (regression)', () async {
-      final start = DateTime.utc(2026, 6, 23, 14, 0);
-      final end = DateTime.utc(2026, 6, 23, 15, 0);
-      final srcEvent = Event(
-        eventId: 'src-1',
-        instanceId: 'src-1',
-        calendarId: sourceCalId,
-        title: 'Timed Event',
-        startDate: start,
-        endDate: end,
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
-      );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toCreate, hasLength(1));
-      final entry = plan.toCreate.first;
-      expect(entry.projectedAllDay, false);
-      expect(entry.projectedStart, start);
-      expect(entry.projectedEnd, end);
-    });
-  });
-
-  group('Safety net -- _execute paths', () {
-    final start = DateTime.utc(2026, 6, 23, 14, 0);
-    final end = DateTime.utc(2026, 6, 23, 15, 0);
-
-    test('create path: createEvent is called with correct values', () async {
-      final srcEvent = Event(
-        eventId: 'src-1',
-        instanceId: 'src-1',
-        calendarId: sourceCalId,
-        title: 'Test',
-        startDate: start,
-        endDate: end,
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
-      );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Test\n---\n🔃 Automatically created by CalSync', isAllDay: false,
-      )).thenAnswer((_) async => 'new-id-1');
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        sourceEventId: 'src-1',
-        targetCalendarId: targetCalId,
-        targetEventId: 'new-id-1',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'new-id-1'))
-          .thenAnswer((_) async {});
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      verify(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Test\n---\n🔃 Automatically created by CalSync', isAllDay: false,
-      )).called(1);
-      expect(result.synced, ['src-1']);
-    });
-
-    test('update path: old event deleted then new event created', () async {
-      final srcEvent = Event(
-        eventId: 'src-1',
-        instanceId: 'src-1',
-        calendarId: sourceCalId,
-        title: 'Test',
-        startDate: start,
-        endDate: end,
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
-      );
-      final tgtEnd = end.subtract(const Duration(hours: 1));
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [{
-          'id': 1, 'source_event_id': 'src-1',
-          'target_event_id': 'tgt-1', 'target_calendar_id': targetCalId,
-        }],
-      );
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => Event(
-          eventId: 'tgt-1',
-          instanceId: 'tgt-1',
-          calendarId: targetCalId,
-          title: 'Test',
-          startDate: start,
-          endDate: tgtEnd,
-          description: 'Test',
-          isAllDay: false,
-          availability: EventAvailability.busy,
-          status: EventStatus.none,
-          isRecurring: false,
-        ),
-      );
-      when(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Test\n---\n🔃 Automatically created by CalSync', isAllDay: false,
-      )).thenAnswer((_) async => 'new-id-2');
-      when(() => calendarService.deleteEvent('tgt-1'))
-                    .thenAnswer((_) async => const CalendarDeleteResult(success: true));
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId, sourceEventId: 'src-1',
-        targetCalendarId: targetCalId, targetEventId: 'new-id-2',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.deleteCreatedEvent(targetCalId, 'tgt-1'))
-          .thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'new-id-2'))
-          .thenAnswer((_) async {});
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      verify(() => calendarService.deleteEvent('tgt-1')).called(1);
-      verify(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Test\n---\n🔃 Automatically created by CalSync', isAllDay: false,
-      )).called(1);
-      expect(result.updated, ['src-1']);
-    });
-
-    test('delete path: deleteEvent and deleteMapping are called', () async {
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [{
-          'id': 1, 'source_event_id': 'src-1',
-          'target_event_id': 'tgt-1', 'target_calendar_id': targetCalId,
-        }],
-      );
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => _makeEvent('tgt-1', end: futureEnd,
-            start: futureEnd.subtract(const Duration(hours: 1))),
-      );
-      when(() => calendarService.getEvent('src-1'))
-          .thenAnswer((_) async => null);
-      when(() => calendarService.deleteEvent('tgt-1'))
-                    .thenAnswer((_) async => const CalendarDeleteResult(success: true));
-      when(() => mappingDb.deleteMapping(1))
-          .thenAnswer((_) async {});
-      when(() => mappingDb.deleteCreatedEvent(targetCalId, 'tgt-1'))
-          .thenAnswer((_) async {});
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      verify(() => calendarService.deleteEvent('tgt-1')).called(1);
-      verify(() => mappingDb.deleteMapping(1)).called(1);
-      verify(() => calendarService.getEvent('src-1')).called(1);
-      expect(result.deleted, ['src-1']);
-    });
-
-    test('errors path: plan.errors non-empty -> returns empty SyncResult', () async {
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [{
-          'id': 1, 'source_event_id': 'src-1',
-          'target_event_id': 'tgt-1', 'target_calendar_id': targetCalId,
-        }],
-      );
-      when(() => calendarService.getEvent('tgt-1'))
-          .thenThrow(Exception('boom'));
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(result.synced, isEmpty);
-      expect(result.skipped, isEmpty);
-      expect(result.deleted, isEmpty);
-      expect(result.updated, isEmpty);
-      expect(result.errors, isNotEmpty);
-    });
-  });
-
-  group('Safety net -- orphan mappings', () {
-    final day1 = DateTime.utc(2026, 6, 23);
-
-    test('target event is null -> mapping deleted, no crash', () async {
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [{
-          'id': 1, 'source_event_id': 'src-1',
-          'target_event_id': 'tgt-1', 'target_calendar_id': targetCalId,
-        }],
-      );
-      when(() => calendarService.getEvent('tgt-1'))
-          .thenAnswer((_) async => null);
-      when(() => mappingDb.deleteMapping(1))
-          .thenAnswer((_) async {});
-      when(() => mappingDb.deleteCreatedEvent(targetCalId, 'tgt-1'))
-          .thenAnswer((_) async {});
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      verify(() => mappingDb.deleteMapping(1)).called(1);
-      expect(plan.errors, isEmpty);
-    });
-
-    test('all-day target with far-future end -> source missing, target deleted', () async {
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [{
-          'id': 1, 'source_event_id': 'src-1',
-          'target_event_id': 'tgt-1', 'target_calendar_id': targetCalId,
-        }],
-      );
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => Event(
-          eventId: 'tgt-1',
-          instanceId: 'tgt-1',
-          calendarId: targetCalId,
-          title: 'Test',
-          startDate: day1,
-          endDate: futureEnd,
-          isAllDay: true,
-          availability: EventAvailability.busy,
-          status: EventStatus.none,
-          isRecurring: false,
-        ),
-      );
-      when(() => calendarService.getEvent('src-1'))
-          .thenAnswer((_) async => null);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toDelete, hasLength(1));
-      expect(plan.errors, isEmpty);
-    });
-  });
-
-  group('Sync loop prevention', () {
-    test('event in sync_created_events is skipped', () async {
-      final srcEvent = _makeEvent('src-1', end: futureEnd, start: futureEnd.subtract(const Duration(hours: 1)));
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toCreate, isEmpty);
-      expect(plan.toSkip.any((e) => e.eventId == 'src-1'), isTrue);
-    });
-
-    test('event NOT in sync_created_events is classified normally', () async {
-      final srcEvent = _makeEvent('src-1', end: futureEnd, start: futureEnd.subtract(const Duration(hours: 1)));
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toCreate, hasLength(1));
-    });
-
-    test('event with marker in description is skipped (description-based detection)', () async {
-      final srcEvent = Event(
-        eventId: 'src-1',
-        instanceId: 'src-1',
-        calendarId: sourceCalId,
-        title: 'Test',
-        startDate: futureEnd.subtract(const Duration(hours: 1)),
-        endDate: futureEnd,
-        description: 'Test\n---\n🔃 Automatically created by CalSync',
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
-      );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toCreate, isEmpty);
-      expect(plan.toSkip.any((e) => e.eventId == 'src-1'), isTrue);
-    });
-
-    test('user event without marker is classified normally', () async {
-      final srcEvent = Event(
-        eventId: 'src-1',
-        instanceId: 'src-1',
-        calendarId: sourceCalId,
-        title: 'Test',
-        startDate: futureEnd.subtract(const Duration(hours: 1)),
-        endDate: futureEnd,
-        description: 'User created event',
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
-      );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toCreate, hasLength(1));
-    });
-
-    test('update detection correctly handles marked description via contains', () async {
-      final start = DateTime.utc(2026, 6, 23, 14, 0);
-      final end = DateTime.utc(2026, 6, 23, 15, 0);
-      final srcEvent = Event(
-        eventId: 'src-1',
-        instanceId: 'src-1',
-        calendarId: sourceCalId,
-        title: 'Test Event',
-        startDate: start,
-        endDate: end,
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
-      );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [{
-          'id': 1, 'source_event_id': 'src-1',
-          'target_event_id': 'tgt-1', 'target_calendar_id': targetCalId,
-        }],
-      );
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => Event(
-          eventId: 'tgt-1',
-          instanceId: 'tgt-1',
-          calendarId: targetCalId,
-          title: 'Busy',
-          description: 'Test Event\n---\n🔃 Automatically created by CalSync',
-          startDate: start,
-          endDate: end,
-          isAllDay: false,
-          availability: EventAvailability.busy,
-          status: EventStatus.none,
-          isRecurring: false,
-        ),
-      );
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toUpdate, isEmpty);
-      expect(plan.toSkip.any((e) => e.eventId == 'src-1'), isTrue);
-    });
-
-    test('null description does not crash (falls back to sync_created_events)', () async {
-      final srcEvent = Event(
-        eventId: 'src-1',
-        instanceId: 'src-1',
-        calendarId: sourceCalId,
-        title: 'Test',
-        startDate: futureEnd.subtract(const Duration(hours: 1)),
-        endDate: futureEnd,
-        description: null,
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
-      );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toCreate, isEmpty);
-      expect(plan.toSkip.any((e) => e.eventId == 'src-1'), isTrue);
-    });
-
-    test('HTML-wrapped description is recognized as unchanged via contains', () async {
-      final start = DateTime.utc(2026, 6, 23, 14, 0);
-      final end = DateTime.utc(2026, 6, 23, 15, 0);
-      final srcEvent = Event(
-        eventId: 'src-1',
-        instanceId: 'src-1',
-        calendarId: sourceCalId,
-        title: 'Doctor Appointment',
-        startDate: start,
-        endDate: end,
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
-      );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [{
-          'id': 1, 'source_event_id': 'src-1',
-          'target_event_id': 'tgt-1', 'target_calendar_id': targetCalId,
-        }],
-      );
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => Event(
-          eventId: 'tgt-1',
-          instanceId: 'tgt-1',
-          calendarId: targetCalId,
-          title: 'Busy',
-          description: '<html><body>Doctor Appointment<br>---<br>🔃 Automatically created by CalSync</body></html>',
-          startDate: start,
-          endDate: end,
-          isAllDay: false,
-          availability: EventAvailability.busy,
-          status: EventStatus.none,
-          isRecurring: false,
-        ),
-      );
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toUpdate, isEmpty);
-      expect(plan.toSkip.any((e) => e.eventId == 'src-1'), isTrue);
-    });
-
-    test('after CREATE, sync_created_events is called with target calendar and event', () async {
-      final srcEvent = _makeEvent('src-1', end: futureEnd, start: futureEnd.subtract(const Duration(hours: 1)));
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => calendarService.createEvent(
-        targetCalId, syncName, any(), any(),
-        description: 'Test Event\n---\n🔃 Automatically created by CalSync', isAllDay: false,
-      )).thenAnswer((_) async => 'new-id');
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        sourceEventId: 'src-1',
-        targetCalendarId: targetCalId,
-        targetEventId: 'new-id',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'new-id'))
-          .thenAnswer((_) async {});
-
-      await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      verify(() => mappingDb.insertCreatedEvent(targetCalId, 'new-id')).called(1);
-    });
-
-    test('after orphan DELETE, sync_created_events is removed', () async {
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [{
-          'id': 1, 'source_event_id': 'src-1',
-          'target_event_id': 'tgt-1', 'target_calendar_id': targetCalId,
-        }],
-      );
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => null,
-      );
-      when(() => mappingDb.deleteMapping(1))
-          .thenAnswer((_) async {});
-      when(() => mappingDb.deleteCreatedEvent(targetCalId, 'tgt-1'))
-          .thenAnswer((_) async {});
-
-      await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      verify(() => mappingDb.deleteCreatedEvent(targetCalId, 'tgt-1')).called(1);
-    });
-
-    test('after UPDATE, old createdEvent removed and new inserted', () async {
-      final start = DateTime.utc(2026, 6, 23, 14, 0);
-      final end = DateTime.utc(2026, 6, 23, 15, 0);
-      final srcEvent = Event(
-        eventId: 'src-1', instanceId: 'src-1', calendarId: sourceCalId,
-        title: 'Test', startDate: start, endDate: end,
-        isAllDay: false, availability: EventAvailability.busy,
-        status: EventStatus.none, isRecurring: false,
-      );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).thenAnswer(
-        (_) async => [{
-          'id': 1, 'source_event_id': 'src-1',
-          'target_event_id': 'tgt-1', 'target_calendar_id': targetCalId,
-        }],
-      );
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-        (_) async => _makeEvent('tgt-1', end: end.subtract(const Duration(minutes: 30)),
-            start: start.add(const Duration(minutes: 30))),
-      );
-      when(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Test\n---\n🔃 Automatically created by CalSync', isAllDay: false,
-      )).thenAnswer((_) async => 'new-id');
-      when(() => calendarService.deleteEvent('tgt-1'))
-                    .thenAnswer((_) async => const CalendarDeleteResult(success: true));
-      when(() => mappingDb.deleteCreatedEvent(targetCalId, 'tgt-1'))
-          .thenAnswer((_) async {});
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId, sourceEventId: 'src-1',
-        targetCalendarId: targetCalId, targetEventId: 'new-id',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'new-id'))
-          .thenAnswer((_) async {});
-
-      await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      verify(() => mappingDb.deleteCreatedEvent(targetCalId, 'tgt-1')).called(1);
-      verify(() => mappingDb.insertCreatedEvent(targetCalId, 'new-id')).called(1);
-    });
-
-    test('bidirectional: profile A creates in B, profile B scanning B skips it', () async {
-      final otherProfileId = 'other-profile';
-      final srcEvent = _makeEvent('src-1', end: futureEnd, start: futureEnd.subtract(const Duration(hours: 1)));
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(otherProfileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-
-      final plan = await engine.runDryRun(
-        profileId: otherProfileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toCreate, isEmpty);
-      expect(plan.toSkip.any((e) => e.eventId == 'src-1'), isTrue);
-    });
-  });
-
-  group('Profile-scoped mappings', () {
-    final otherProfileId = 'other-profile';
-
-    test('same source event synced by 2 profiles creates independent mappings', () async {
-      final start = DateTime.utc(2026, 6, 23, 14, 0);
-      final end = DateTime.utc(2026, 6, 23, 15, 0);
-      final srcEvent = Event(
-        eventId: 'src-1', instanceId: 'src-1', calendarId: sourceCalId,
-        title: 'Test', startDate: start, endDate: end,
-        isAllDay: false, availability: EventAvailability.busy,
-        status: EventStatus.none, isRecurring: false,
-      );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Test\n---\n🔃 Automatically created by CalSync', isAllDay: false,
-      )).thenAnswer((_) async => 'tgt-A');
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        sourceEventId: 'src-1',
-        targetCalendarId: targetCalId,
-        targetEventId: 'tgt-A',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'tgt-A'))
-          .thenAnswer((_) async {});
-
-      await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      verify(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        sourceEventId: 'src-1',
-        targetCalendarId: targetCalId,
-        targetEventId: 'tgt-A',
-        syncedAt: any(named: 'syncedAt'),
-      )).called(1);
-
-      verifyNever(() => mappingDb.insertMapping(
-        profileId: otherProfileId,
-        sourceCalendarId: sourceCalId,
-        sourceEventId: 'src-1',
-        targetCalendarId: targetCalId,
-        targetEventId: any(named: 'targetEventId'),
-        syncedAt: any(named: 'syncedAt'),
-      ));
-    });
-
-    test('isEventSynced is called with the correct profile ID', () async {
-      final srcEvent = _makeEvent('src-1', end: futureEnd, start: futureEnd.subtract(const Duration(hours: 1)));
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-
-      await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      verify(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1')).called(1);
-    });
-
-    test('listMappingsForCalendar is called with the correct profile ID', () async {
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-
-      await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      verify(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId)).called(1);
-    });
-  });
-
-  group('Recurring events expand to independent instances', () {
-    final start = DateTime.utc(2026, 6, 23, 14, 0);
-    final end = DateTime.utc(2026, 6, 23, 15, 0);
-
-    Event occurrence(String id, String instanceId,
-        {DateTime? startDate, DateTime? endDate}) {
-      return Event(
-        eventId: id,
-        instanceId: instanceId,
-        calendarId: sourceCalId,
-        title: 'Weekly Standup',
-        startDate: startDate ?? start,
-        endDate: endDate ?? end,
-        isAllDay: false,
-        isRecurring: true,
-        recurrenceRule: null,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-      );
+  Future<SyncResult> sync({
+    SyncProfile? forProfile,
+    String title = '',
+    bool copyDescription = true,
+    bool copyLocation = true,
+    bool omitSourceTitle = false,
+  }) {
+    final selected = forProfile ?? profile;
+    return engine.runSync(
+      profileId: selected.id,
+      sourceCalendarId: selected.sourceCalendarId!,
+      targetCalendarId: 'family',
+      syncEventName: title,
+      copyDescription: copyDescription,
+      copyLocation: copyLocation,
+      omitSourceTitle: omitSourceTitle,
+    );
+  }
+
+  Future<SyncPlan> preview() => engine.runDryRun(
+    profileId: profile.id,
+    sourceCalendarId: 'source',
+    targetCalendarId: 'family',
+    syncEventName: '',
+    copyDescription: true,
+    copyLocation: true,
+  );
+
+  Future<void> map(
+    String source,
+    String target, {
+    String? instance,
+    SyncProfile? owner,
+    bool registered = true,
+  }) async {
+    final selected = owner ?? profile;
+    await db.insertMapping(
+      profileId: selected.id,
+      sourceCalendarId: selected.sourceCalendarId!,
+      sourceEventId: source,
+      sourceInstanceId: instance,
+      targetCalendarId: 'family',
+      targetEventId: target,
+      syncedAt: DateTime.now().toIso8601String(),
+    );
+    if (registered) await db.insertCreatedEvent('family', target);
+  }
+
+  Event target(
+    String id, {
+    String title = 'Training',
+    String? location,
+    String? desc,
+  }) => event(
+    id,
+    calendar: 'family',
+    title: title,
+    location: location,
+    description: desc ?? buildDescription('Training', null, true),
+  );
+
+  Future<void> removeSource({bool verified = true}) async {
+    calendar.events['target'] = target('target');
+    await map('match', 'target');
+    if (verified) {
+      calendar.changes[('match', null)] = (removed: true, movedId: null);
     }
+  }
 
-    Event targetEvent(String id, {DateTime? endDate}) {
-      return Event(
-        eventId: id,
-        instanceId: id,
-        calendarId: targetCalId,
-        title: 'Busy',
-        description: 'Weekly Standup\n---\n🔃 Automatically created by CalSync',
-        startDate: start,
-        endDate: endDate ?? futureEnd,
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
-      );
-    }
+  test('creates once and keeps the same mapping on the next sync', () async {
+    calendar.events['match'] = event(
+      'match',
+      location: 'Pitch A',
+      description: 'Kit',
+    );
+    expect((await sync()).synced, ['match']);
+    expect((await sync()).skipped, ['match']);
+    expect(calendar.creates, 1);
+    expect(calendar.events['created-1']!.location, 'Pitch A');
+    expect(calendar.events['created-1']!.description, contains('Kit'));
+    expect(await db.isEventCreatedBySync('family', 'created-1'), isTrue);
+  });
 
-    test('occurrence creates standalone target without recurrence rule', () async {
-      final srcEvent = occurrence('src-1', 'src-1@t1');
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1',
-              sourceInstanceId: 'src-1@t1'))
-          .thenAnswer((_) async => false);
-      when(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Weekly Standup\n---\n🔃 Automatically created by CalSync',
-        isAllDay: false,
-      )).thenAnswer((_) async => 'new-id-1');
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        sourceEventId: 'src-1',
-        sourceInstanceId: 'src-1@t1',
-        targetCalendarId: targetCalId,
-        targetEventId: 'new-id-1',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'new-id-1'))
-          .thenAnswer((_) async {});
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      verify(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Weekly Standup\n---\n🔃 Automatically created by CalSync',
-        isAllDay: false,
-      )).called(1);
-      expect(result.synced, ['src-1']);
+  final changes = <String, Event>{
+    'title colliding with a substring': event('match', title: 'Train'),
+    'start time': event('match', from: start.add(const Duration(minutes: 30))),
+    'end time': event('match', until: end.add(const Duration(minutes: 30))),
+    'date': event(
+      'match',
+      from: start.add(const Duration(days: 1)),
+      until: end.add(const Duration(days: 1)),
+    ),
+    'location': event('match', location: 'Pitch B'),
+    'description': event('match', description: 'New details'),
+    'all-day status': event('match', allDay: true),
+  };
+  for (final change in changes.entries) {
+    test('updates existing event for ${change.key}', () async {
+      calendar.events['match'] = change.value;
+      calendar.events['target'] = target('target');
+      await map('match', 'target');
+      final rows = await db.listMappingsForProfile(profile.id);
+      expect((await preview()).toUpdate, hasLength(1));
+      expect((await sync()).updated, ['match']);
+      expect(calendar.updated, ['target']);
+      expect(calendar.creates, 0);
+      expect(calendar.deleted, isEmpty);
+      expect(await db.listMappingsForProfile(profile.id), rows);
+      expect((await sync()).skipped, ['match']);
     });
+  }
 
-    test('5 instances create 5 independent targets and 5 mappings', () async {
-      final instances = List.generate(
-        5,
-        (i) => occurrence('src-1', 'src-1@t$i'),
+  test(
+    'clears copied fields and preserves the custom title and title privacy',
+    () async {
+      calendar.events['match'] = event(
+        'match',
+        description: 'Personal details',
+        location: 'Pitch',
       );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => instances);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(
-            profileId,
-            sourceCalId,
-            'src-1',
-            sourceInstanceId: any(named: 'sourceInstanceId'),
-          )).thenAnswer((_) async => false);
-
-      var createCount = 0;
-      when(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: any(named: 'description'),
-        isAllDay: false,
-      )).thenAnswer((_) async {
-        createCount++;
-        return 'new-id-$createCount';
-      });
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        sourceEventId: 'src-1',
-        sourceInstanceId: any(named: 'sourceInstanceId'),
-        targetCalendarId: targetCalId,
-        targetEventId: any(named: 'targetEventId'),
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(
-            targetCalId,
-            any(),
-          )).thenAnswer((_) async {});
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
+      calendar.events['target'] = target(
+        'target',
+        location: 'Old pitch',
+        desc: 'Old details\n$marker',
       );
-
-      verify(() => calendarService.createEvent(
-            targetCalId, syncName, start, end,
-            description: any(named: 'description'),
-            isAllDay: false,
-          )).called(5);
-      verify(() => mappingDb.insertMapping(
-            profileId: profileId,
-            sourceCalendarId: sourceCalId,
-            sourceEventId: 'src-1',
-            sourceInstanceId: any(named: 'sourceInstanceId'),
-            targetCalendarId: targetCalId,
-            targetEventId: any(named: 'targetEventId'),
-            syncedAt: any(named: 'syncedAt'),
-          )).called(5);
-      expect(result.synced.length, 5);
-    });
-
-    test('moved occurrence: old slot deleted, new slot created', () async {
-      final newOccurrence = occurrence('src-1', 'src-1@t2');
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [newOccurrence]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => [
-                {
-                  'id': 1,
-                  'source_event_id': 'src-1',
-                  'source_instance_id': 'src-1@t1',
-                  'target_event_id': 'tgt-old',
-                  'target_calendar_id': targetCalId,
-                },
-              ]);
-      when(() => calendarService.getEvent('tgt-old'))
-          .thenAnswer((_) async => targetEvent('tgt-old'));
-      when(() => calendarService.getEvent('src-1'))
-          .thenAnswer((_) async => targetEvent('src-1'));
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1',
-              sourceInstanceId: 'src-1@t2'))
-          .thenAnswer((_) async => false);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toDelete, hasLength(1));
-      expect(plan.toDelete.first['source_instance_id'], 'src-1@t1');
-      expect(plan.toCreate, hasLength(1));
-      expect(plan.toCreate.first.sourceInstanceId, 'src-1@t2');
-    });
-
-    test('deleted occurrence exception removes only its target', () async {
-      final inst2 = occurrence('src-1', 'src-1@t2');
-      final inst3 = occurrence('src-1', 'src-1@t3');
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [inst2, inst3]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => [
-                {
-                  'id': 1,
-                  'source_event_id': 'src-1',
-                  'source_instance_id': 'src-1@t1',
-                  'target_event_id': 'tgt-1',
-                  'target_calendar_id': targetCalId,
-                },
-                {
-                  'id': 2,
-                  'source_event_id': 'src-1',
-                  'source_instance_id': 'src-1@t2',
-                  'target_event_id': 'tgt-2',
-                  'target_calendar_id': targetCalId,
-                },
-              ]);
-      when(() => calendarService.getEvent('tgt-1'))
-          .thenAnswer((_) async => targetEvent('tgt-1'));
-      when(() => calendarService.getEvent('tgt-2'))
-          .thenAnswer((_) async => targetEvent('tgt-2'));
-      when(() => calendarService.getEvent('src-1'))
-          .thenAnswer((_) async => targetEvent('src-1'));
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1',
-              sourceInstanceId: any(named: 'sourceInstanceId')))
-          .thenAnswer((_) async => true);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toDelete, hasLength(1));
-      expect(plan.toDelete.first['source_instance_id'], 'src-1@t1');
-    });
-
-    test('deleted series removes all its instance mappings', () async {
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => [
-                {
-                  'id': 1,
-                  'source_event_id': 'src-1',
-                  'source_instance_id': 'src-1@t1',
-                  'target_event_id': 'tgt-1',
-                  'target_calendar_id': targetCalId,
-                },
-                {
-                  'id': 2,
-                  'source_event_id': 'src-1',
-                  'source_instance_id': 'src-1@t2',
-                  'target_event_id': 'tgt-2',
-                  'target_calendar_id': targetCalId,
-                },
-              ]);
-      when(() => calendarService.getEvent('tgt-1'))
-          .thenAnswer((_) async => targetEvent('tgt-1'));
-      when(() => calendarService.getEvent('tgt-2'))
-          .thenAnswer((_) async => targetEvent('tgt-2'));
-      when(() => calendarService.getEvent('src-1'))
-          .thenAnswer((_) async => null);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toDelete, hasLength(2));
-    });
-
-    test('aged-out occurrence is kept', () async {
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => [
-                {
-                  'id': 1,
-                  'source_event_id': 'src-1',
-                  'source_instance_id': 'src-1@t1',
-                  'target_event_id': 'tgt-1',
-                  'target_calendar_id': targetCalId,
-                },
-              ]);
-      when(() => calendarService.getEvent('tgt-1'))
-          .thenAnswer((_) async => targetEvent('tgt-1', endDate: oldEnd));
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toDelete, isEmpty);
-      verifyNever(() => calendarService.getEvent('src-1'));
-    });
-
-    test('recently passed occurrence is kept', () async {
-      final recentlyPassedEnd =
-          DateTime.now().subtract(const Duration(hours: 2));
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => [
-                {
-                  'id': 1,
-                  'source_event_id': 'src-1',
-                  'source_instance_id': 'src-1@t1',
-                  'target_event_id': 'tgt-1',
-                  'target_calendar_id': targetCalId,
-                },
-              ]);
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-          (_) async => targetEvent('tgt-1', endDate: recentlyPassedEnd));
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toDelete, isEmpty);
-      verifyNever(() => calendarService.getEvent('src-1'));
-    });
-
-    test('deleted series keeps passed occurrence, deletes future ones',
-        () async {
-      final recentlyPassedEnd =
-          DateTime.now().subtract(const Duration(hours: 2));
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => [
-                {
-                  'id': 1,
-                  'source_event_id': 'src-1',
-                  'source_instance_id': 'src-1@t1',
-                  'target_event_id': 'tgt-1',
-                  'target_calendar_id': targetCalId,
-                },
-                {
-                  'id': 2,
-                  'source_event_id': 'src-1',
-                  'source_instance_id': 'src-1@t2',
-                  'target_event_id': 'tgt-2',
-                  'target_calendar_id': targetCalId,
-                },
-                {
-                  'id': 3,
-                  'source_event_id': 'src-1',
-                  'source_instance_id': 'src-1@t3',
-                  'target_event_id': 'tgt-3',
-                  'target_calendar_id': targetCalId,
-                },
-              ]);
-      when(() => calendarService.getEvent('tgt-1')).thenAnswer(
-          (_) async => targetEvent('tgt-1', endDate: recentlyPassedEnd));
-      when(() => calendarService.getEvent('tgt-2'))
-          .thenAnswer((_) async => targetEvent('tgt-2'));
-      when(() => calendarService.getEvent('tgt-3'))
-          .thenAnswer((_) async => targetEvent('tgt-3'));
-      when(() => calendarService.getEvent('src-1'))
-          .thenAnswer((_) async => null);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toDelete, hasLength(2));
+      await map('match', 'target');
       expect(
-        plan.toDelete.map((m) => m['source_instance_id']),
-        isNot(contains('src-1@t1')),
+        (await sync(
+          title: 'Busy',
+          copyDescription: false,
+          copyLocation: false,
+          omitSourceTitle: true,
+        )).updated,
+        ['match'],
       );
-    });
+      final written = calendar.events['target']!;
+      expect(written.title, 'Busy');
+      expect(written.location, isNull);
+      expect(written.description, isNot(contains('Training')));
+      expect(written.description, isNot(contains('Personal details')));
+    },
+  );
 
-    test('legacy series mapping is lazily replaced', () async {
-      final inst1 = occurrence('src-1', 'src-1@t1');
-      final inst2 = occurrence('src-1', 'src-1@t2');
+  test(
+    'failed in-place update keeps the target and mapping and creates no replacement',
+    () async {
+      calendar.events['match'] = event('match', title: 'Changed');
+      calendar.events['target'] = target('target');
+      await map('match', 'target');
+      calendar.rejectUpdate = true;
+      expect((await sync()).errors, isNotEmpty);
+      expect(calendar.updated, isEmpty);
+      expect(calendar.deleted, isEmpty);
+      expect(calendar.creates, 0);
+      expect(await db.isEventSynced(profile.id, 'source', 'match'), isTrue);
+    },
+  );
 
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [inst1, inst2]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => [
-                {
-                  'id': 1,
-                  'source_event_id': 'src-1',
-                  'source_instance_id': null,
-                  'target_event_id': 'tgt-series',
-                  'target_calendar_id': targetCalId,
-                },
-              ]);
-      when(() => calendarService.getEvent('tgt-series'))
-          .thenAnswer((_) async => targetEvent('tgt-series'));
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1',
-              sourceInstanceId: any(named: 'sourceInstanceId')))
-          .thenAnswer((_) async => false);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
+  test(
+    'a moved standalone source outside the window updates its existing target',
+    () async {
+      calendar.events['match'] = event(
+        'match',
+        from: start.add(const Duration(days: 60)),
+        until: end.add(const Duration(days: 60)),
       );
+      calendar.events['target'] = target('target');
+      await map('match', 'target');
+      expect((await sync()).updated, ['match']);
+      expect(calendar.creates, 0);
+      expect(calendar.deleted, isEmpty);
+    },
+  );
 
+  test(
+    'dry run and automatic sync keep confirmed removals until explicit confirmation',
+    () async {
+      await removeSource();
+      final plans = await Future.wait([preview(), preview()]);
+      expect(plans.first.toDelete.single.event.eventId, 'target');
+      expect(calendar.deleted, isEmpty);
+      expect(await db.isEventSynced(profile.id, 'source', 'match'), isTrue);
+      expect((await sync()).deleted, isEmpty);
+      expect(
+        await engine.deleteConfirmedTargets(
+          plans.first.toDelete,
+          verifySourceRemoval: true,
+        ),
+        isTrue,
+      );
+      expect(calendar.deleted, ['target']);
+      expect(await db.isEventSynced(profile.id, 'source', 'match'), isFalse);
+    },
+  );
+
+  test(
+    'missing data without positive removal evidence causes no deletion',
+    () async {
+      await removeSource(verified: false);
+      expect((await preview()).toDelete, isEmpty);
+      calendar.events.remove('target');
+      expect((await preview()).errors, isNotEmpty);
+      expect(calendar.deleted, isEmpty);
+      expect(await db.isEventSynced(profile.id, 'source', 'match'), isTrue);
+    },
+  );
+
+  for (final failure in [
+    'offline',
+    'permission',
+    'source read',
+    'target read',
+    'reappeared',
+    'target changed',
+  ]) {
+    test('confirmed deletion stops on $failure', () async {
+      await removeSource();
+      final plan = await preview();
       expect(plan.toDelete, hasLength(1));
-      expect(plan.toDelete.first['target_event_id'], 'tgt-series');
-      expect(plan.toCreate, hasLength(2));
-    });
-
-    test('legacy non-recurring mapping is untouched', () async {
-      final srcEvent = Event(
-        eventId: 'src-1',
-        instanceId: 'src-1',
-        calendarId: sourceCalId,
-        title: 'Doctor Appointment',
-        startDate: start,
-        endDate: end,
-        isAllDay: false,
-        isRecurring: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
+      switch (failure) {
+        case 'offline':
+          calendar.offline = true;
+        case 'permission':
+          calendar.permissionDenied = true;
+        case 'source read':
+          calendar.failedReads.add('match');
+        case 'target read':
+          calendar.failedReads.add('target');
+        case 'reappeared':
+          calendar.changes.clear();
+        case 'target changed':
+          calendar.events['target'] = target(
+            'target',
+            title: 'Manually edited',
+          );
+      }
+      expect(
+        await engine.deleteConfirmedTargets(
+          plan.toDelete,
+          verifySourceRemoval: true,
+        ),
+        isFalse,
       );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => [
-                {
-                  'id': 1,
-                  'source_event_id': 'src-1',
-                  'source_instance_id': null,
-                  'target_event_id': 'tgt-1',
-                  'target_calendar_id': targetCalId,
-                },
-              ]);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => true);
-      when(() => calendarService.getEvent('tgt-1'))
-          .thenAnswer((_) async => Event(
-                eventId: 'tgt-1',
-                instanceId: 'tgt-1',
-                calendarId: targetCalId,
-                title: 'Busy',
-                description:
-                    'Doctor Appointment\n---\n🔃 Automatically created by CalSync',
-                startDate: start,
-                endDate: end,
-                isAllDay: false,
-                availability: EventAvailability.busy,
-                status: EventStatus.none,
-                isRecurring: false,
-              ));
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      expect(plan.toDelete, isEmpty);
-      expect(plan.toSkip.any((e) => e.eventId == 'src-1'), isTrue);
+      expect(calendar.deleted, isEmpty);
+      expect(await db.isEventSynced(profile.id, 'source', 'match'), isTrue);
     });
+  }
 
-    test('failed legacy deletion keeps mapping for retry', () async {
-      final inst1 = occurrence('src-1', 'src-1@t1');
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [inst1]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => [
-                {
-                  'id': 1,
-                  'source_event_id': 'src-1',
-                  'source_instance_id': null,
-                  'target_event_id': 'tgt-series',
-                  'target_calendar_id': targetCalId,
-                },
-              ]);
-      when(() => calendarService.getEvent('tgt-series'))
-          .thenAnswer((_) async => targetEvent('tgt-series'));
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1',
-              sourceInstanceId: 'src-1@t1'))
-          .thenAnswer((_) async => false);
-      when(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: any(named: 'description'),
-        isAllDay: false,
-      )).thenAnswer((_) async => 'new-id-1');
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        sourceEventId: 'src-1',
-        sourceInstanceId: any(named: 'sourceInstanceId'),
-        targetCalendarId: targetCalId,
-        targetEventId: any(named: 'targetEventId'),
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(
-            targetCalId,
-            any(),
-          )).thenAnswer((_) async {});
-      when(() => calendarService.deleteEvent('tgt-series')).thenAnswer(
-          (_) async => const CalendarDeleteResult(success: false));
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      verifyNever(() => mappingDb.deleteMapping(1));
-      expect(result.errors, isNotEmpty);
-    });
+  test('incomplete source listing blocks the plan', () async {
+    await removeSource();
+    calendar.failedReads.add('source');
+    expect((await preview()).errors, isNotEmpty);
+    expect(calendar.deleted, isEmpty);
   });
 
-  group('Original event name (empty syncEventName)', () {
-    test('empty syncEventName uses source event title as projectedTitle', () async {
-      final srcEvent = Event(
-        eventId: 'src-1',
-        instanceId: 'src-1',
-        calendarId: sourceCalId,
-        title: 'Doctor Appointment',
-        startDate: futureEnd.subtract(const Duration(hours: 1)),
-        endDate: futureEnd,
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
+  test('failed calendar deletion keeps the mapping for retry', () async {
+    await removeSource();
+    final plan = await preview();
+    calendar.rejectDelete = true;
+    expect(await engine.deleteConfirmedTargets(plan.toDelete), isFalse);
+    expect(await db.isEventSynced(profile.id, 'source', 'match'), isTrue);
+    expect(await db.isEventCreatedBySync('family', 'target'), isTrue);
+  });
+
+  test(
+    'prioritizes a verified moved series exception and suppresses a duplicate',
+    () async {
+      calendar.events['moved'] = event(
+        'moved',
+        from: start.add(const Duration(days: 1)),
+        until: end.add(const Duration(days: 1)),
       );
+      calendar.events['target'] = target('target');
+      await map('series', 'target', instance: 'series@old');
+      calendar.changes[('series', 'series@old')] = (
+        removed: false,
+        movedId: 'moved',
+      );
+      expect((await preview()).toCreate, isEmpty);
+      expect((await sync()).updated, ['moved']);
+      expect((await sync()).skipped, ['moved']);
+      expect(calendar.creates, 0);
+    },
+  );
 
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
+  test(
+    'an uncertain new series slot is withheld if the original slot vanished',
+    () async {
+      calendar.events['slot2'] = event(
+        'series',
+        recurring: true,
+        instance: 'series@new',
+      );
+      calendar.events['target'] = target('target');
+      await map('series', 'target', instance: 'series@old');
+      final plan = await preview();
+      expect(plan.toCreate, isEmpty);
+      expect(plan.toDelete, isEmpty);
+    },
+  );
 
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
+  test('only the canceled occurrence is proposed for deletion', () async {
+    calendar.events['slot2'] = event(
+      'series',
+      recurring: true,
+      instance: 'series@two',
+    );
+    calendar.events['target1'] = target('target1');
+    calendar.events['target2'] = target('target2');
+    await map('series', 'target1', instance: 'series@one');
+    await map('series', 'target2', instance: 'series@two');
+    calendar.changes[('series', 'series@one')] = (removed: true, movedId: null);
+    final plan = await preview();
+    expect(plan.toDelete.single.event.eventId, 'target1');
+    expect(plan.toSkip.single.instanceId, 'series@two');
+  });
+
+  test(
+    'a legacy recurring mapping is preserved without recreating the series',
+    () async {
+      calendar.events['slot1'] = event(
+        'series',
+        recurring: true,
+        instance: 'series@one',
+      );
+      calendar.events['target'] = target('target');
+      await map('series', 'target');
+      expect((await sync()).errors, isNotEmpty);
+      expect(calendar.creates, 0);
+      expect(calendar.deleted, isEmpty);
+    },
+  );
+
+  test(
+    'syncs two profiles into a shared calendar with independent ownership',
+    () async {
+      final second = await addProfile('Second team', 'second');
+      calendar.events['one'] = event('one');
+      calendar.events['two'] = event('two', calendar: 'second');
+      expect((await sync()).synced, ['one']);
+      expect((await sync(forProfile: second)).synced, ['two']);
+      final preview = await engine.previewProfileDeletion(profile.id);
+      expect(preview.single.event.eventId, 'created-1');
+      expect(await engine.deleteConfirmedTargets(preview), isTrue);
+      expect(calendar.events.containsKey('created-2'), isTrue);
+      expect(
+        (await db.listMappingsForProfile(second.id)).single['target_event_id'],
+        'created-2',
+      );
+    },
+  );
+
+  test(
+    'shared target mapping is ambiguous and cannot be written or deleted',
+    () async {
+      final second = await addProfile('Second team', 'second');
+      calendar.events['match'] = event('match', title: 'Changed');
+      calendar.events['target'] = target('target');
+      await map('match', 'target');
+      await map('other', 'target', owner: second);
+      expect((await sync()).errors, isNotEmpty);
+      await expectLater(
+        engine.previewProfileDeletion(profile.id),
+        throwsStateError,
+      );
+      expect(calendar.updated, isEmpty);
+      expect(calendar.deleted, isEmpty);
+    },
+  );
+
+  test(
+    'foreign, unregistered and marker-only targets never establish ownership',
+    () async {
+      calendar.events['match'] = event('match', title: 'Changed');
+      for (final foreign in [
+        event('target', calendar: 'family', description: 'Manual'),
+        event('target', calendar: 'another-calendar', description: marker),
+        target('target'),
+      ]) {
+        calendar.events['target'] = foreign;
+        if (!await db.isEventSynced(profile.id, 'source', 'match')) {
+          await map('match', 'target', registered: false);
+        }
+        expect((await sync()).errors, isNotEmpty);
+        await expectLater(
+          engine.previewProfileDeletion(profile.id),
+          throwsStateError,
+        );
+      }
+      expect(calendar.updated, isEmpty);
+      expect(calendar.deleted, isEmpty);
+    },
+  );
+
+  test(
+    'an unmapped marked candidate is displayed but never adopted or deleted',
+    () async {
+      calendar.events['orphan'] = target('orphan');
+      calendar.events['match'] = event('match');
+      final plan = await preview();
+      expect(plan.unmappedCandidates.single.eventId, 'orphan');
+      expect(plan.toCreate, isEmpty);
+      expect(plan.toDelete, isEmpty);
+      expect((await sync()).synced, isEmpty);
+      expect(await db.listMappingsForProfile(profile.id), isEmpty);
+      expect(calendar.deleted, isEmpty);
+    },
+  );
+
+  test('removing only a profile retains the calendar events', () async {
+    calendar.events['target'] = target('target');
+    await map('match', 'target');
+    await profiles.deleteProfile(profile.id);
+    expect(calendar.events.containsKey('target'), isTrue);
+    expect(await db.listMappingsForProfile(profile.id), isEmpty);
+  });
+
+  test(
+    'an uncertain create response does not allow a second calendar write',
+    () async {
+      calendar.events['match'] = event('match');
+      calendar.failAfterCreate = true;
+      expect((await sync()).errors, isNotEmpty);
+      // Hide the committed calendar row as if the next local read were stale.
+      calendar.events.remove('created-1');
+      expect((await sync()).errors, isNotEmpty);
+      expect(calendar.creates, 1);
+      expect(await db.hasPendingCreations(profile.id), isTrue);
+    },
+  );
+
+  test(
+    'a DB failure rolls back the mapping but preserves the reservation',
+    () async {
+      calendar.events['match'] = event('match');
+      final raw = await db.database;
+      await raw.execute("""
+      CREATE TRIGGER fail_created_events BEFORE INSERT ON sync_created_events
+      BEGIN SELECT RAISE(ABORT, 'test failure'); END
+    """);
+      expect((await sync()).errors, isNotEmpty);
+      expect(await db.listMappingsForProfile(profile.id), isEmpty);
+      expect(await db.hasPendingCreations(profile.id), isTrue);
+      await expectLater(profiles.deleteProfile(profile.id), throwsStateError);
+      expect(calendar.creates, 1);
+    },
+  );
+
+  test('concurrent runs share the durable create reservation', () async {
+    calendar.events['match'] = event('match');
+    await Future.wait([sync(), sync()]);
+    expect(calendar.creates, 1);
+    expect(await db.listMappingsForProfile(profile.id), hasLength(1));
+  });
+
+  test(
+    'standalone and multi-day all-day dates keep their calendar-day semantics',
+    () async {
+      final day = DateTime(start.year, start.month, start.day);
+      final next = DateTime(day.year, day.month, day.day + 1);
+      final later = DateTime(day.year, day.month, day.day + 3);
+      calendar.events['single'] = event(
+        'single',
+        from: day,
+        until: day,
+        allDay: true,
+      );
+      calendar.events['multi'] = event(
+        'multi',
+        from: day,
+        until: later,
+        allDay: true,
+      );
+      expect((await sync()).synced, ['single', 'multi']);
+      expect(calendar.events['created-1']!.endDate, next);
+      expect(calendar.events['created-2']!.endDate, later);
+      expect((await sync()).updated, isEmpty);
+    },
+  );
+
+  test(
+    'a listed exception receives a stable original occurrence mapping',
+    () async {
+      calendar.events['master-slot'] = event(
+        'series',
+        instance: 'series@one',
+        recurring: true,
+      );
+      calendar.events['exception'] = event(
+        'exception',
+        title: 'Moved training',
+      );
+      calendar.exceptionKeys['exception'] = ('series', 'series@one');
+      expect((await sync()).synced, ['series']);
+      final mapping = (await db.listMappingsForProfile(profile.id)).single;
+      expect(mapping['source_instance_id'], 'series@one');
+      expect(calendar.events['created-1']!.title, 'Moved training');
+      expect((await sync()).skipped, ['exception']);
+      expect(calendar.creates, 1);
+    },
+  );
+
+  test(
+    'past instances are retained when the provider reports a removed series',
+    () async {
+      final old = DateTime.now().subtract(const Duration(days: 1));
+      calendar.events['past'] = event(
+        'past',
+        calendar: 'family',
+        from: old,
+        until: old,
+        description: buildDescription('Training', null, false),
+      );
+      calendar.events['future'] = target('future');
+      await map('series', 'past', instance: 'series@past');
+      await map('series', 'future', instance: 'series@future');
+      calendar.changes[('series', 'series@past')] = (
+        removed: true,
+        movedId: null,
+      );
+      calendar.changes[('series', 'series@future')] = (
+        removed: true,
+        movedId: null,
+      );
+      expect((await preview()).toDelete.map((row) => row.event.eventId), [
+        'future',
+      ]);
+      expect(calendar.events.containsKey('past'), isTrue);
+    },
+  );
+
+  test(
+    'database failure after deletion preserves the original association',
+    () async {
+      await removeSource();
+      final plan = await preview();
+      final raw = await db.database;
+      await raw.execute("""
+      CREATE TRIGGER fail_mapping_removal BEFORE DELETE ON sync_mappings
+      BEGIN SELECT RAISE(ABORT, 'test failure'); END
+    """);
+      expect(await engine.deleteConfirmedTargets(plan.toDelete), isFalse);
+      expect(await db.isEventSynced(profile.id, 'source', 'match'), isTrue);
+      expect(await db.isEventCreatedBySync('family', 'target'), isTrue);
+      expect(await engine.deleteConfirmedTargets(plan.toDelete), isFalse);
+      expect(calendar.deleted, ['target']);
+      expect(await db.hasPendingMutations(profile.id), isTrue);
+      expect((await preview()).errors.single, contains('unconfirmed'));
+    },
+  );
+
+  test(
+    'database upgrade from v9 preserves profiles and ownership records',
+    () async {
+      await map('match', 'target');
+      final old = await db.database;
+      await old.execute('DROP TABLE sync_creation_reservations');
+      await old.execute('DROP TABLE sync_target_mutations');
+      await old.execute('PRAGMA user_version = 9');
+      await old.close();
+      DatabaseProvider.setTestPath('${temp.path}/calendar.db');
+      db = MappingDatabase();
+      profiles = ProfileService();
+      final migrated = await db.database;
+      expect(
+        (await migrated.rawQuery('PRAGMA user_version')).single.values.single,
+        11,
+      );
+      expect((await profiles.getProfile(profile.id))!.name, 'First team');
+      expect(await db.isEventSynced(profile.id, 'source', 'match'), isTrue);
+      expect(await db.isEventCreatedBySync('family', 'target'), isTrue);
+      expect(await db.hasPendingCreations(profile.id), isFalse);
+    },
+  );
+
+  test(
+    'neither a generated event nor a marked source is copied back',
+    () async {
+      calendar.events['tracked'] = event('tracked');
+      calendar.events['marked'] = event('marked', description: marker);
+      await db.insertCreatedEvent('source', 'tracked');
+      expect((await sync()).skipped, ['tracked', 'marked']);
+      expect(calendar.creates, 0);
+    },
+  );
+
+  test(
+    'an old standalone target outside the safety window is preserved',
+    () async {
+      final old = DateTime.now().subtract(const Duration(days: 10));
+      calendar.events['target'] = event(
+        'target',
+        calendar: 'family',
+        from: old,
+        until: old,
+        description: buildDescription('Training', null, false),
+      );
+      await map('match', 'target');
+      calendar.failedReads.add('match');
+      final plan = await preview();
+      expect(plan.toDelete, isEmpty);
+      expect(plan.errors, isEmpty);
+      expect(await db.isEventSynced(profile.id, 'source', 'match'), isTrue);
+    },
+  );
+
+  test(
+    'an unchanged recent source outside the listing is classified by ID',
+    () async {
+      final yesterday = DateTime.now().subtract(const Duration(days: 1));
+      calendar.events['match'] = event(
+        'match',
+        from: yesterday,
+        until: yesterday,
+      );
+      calendar.events['target'] = event(
+        'target',
+        calendar: 'family',
+        from: yesterday,
+        until: yesterday,
+        description: buildDescription('Training', null, false),
+      );
+      await map('match', 'target');
+      expect((await preview()).toSkip.single.eventId, 'match');
+    },
+  );
+
+  test('an all-day date move updates the same existing target', () async {
+    final day = DateTime(start.year, start.month, start.day);
+    final tomorrow = DateTime(day.year, day.month, day.day + 1);
+    final later = DateTime(day.year, day.month, day.day + 2);
+    calendar.events['match'] = event(
+      'match',
+      from: tomorrow,
+      until: later,
+      allDay: true,
+    );
+    calendar.events['target'] = event(
+      'target',
+      calendar: 'family',
+      from: day,
+      until: tomorrow,
+      allDay: true,
+      description: buildDescription('Training', null, false),
+    );
+    await map('match', 'target');
+    expect((await sync()).updated, ['match']);
+    expect(calendar.events['target']!.startDate, tomorrow);
+    expect(calendar.events['target']!.endDate, later);
+    expect(calendar.creates, 0);
+  });
+
+  test(
+    'create transfers exact timed dates and profile title without optional location',
+    () async {
+      calendar.events['match'] = event(
+        'match',
+        description: 'Old text',
+        location: 'Pitch',
+      );
+      expect(
+        (await sync(
+          title: 'Busy',
+          copyDescription: false,
+          copyLocation: false,
+        )).synced,
+        ['match'],
+      );
+      final written = calendar.events['created-1']!;
+      expect(written.title, 'Busy');
+      expect(written.description, buildDescription('Training', null, false));
+      expect(written.location, isNull);
+      expect(written.startDate, start);
+      expect(written.endDate, end);
+      expect(written.isAllDay, isFalse);
+    },
+  );
+
+  test('an unchanged Google-style description wrapper is recognized', () async {
+    calendar.events['match'] = event('match');
+    final wrapped =
+        "<p>${buildDescription('Training', null, false).replaceAll('\n', '<br>')}</p>";
+    calendar.events['target'] = target('target', desc: wrapped);
+    await map('match', 'target');
+    expect((await sync()).skipped, ['match']);
+    expect(calendar.updated, isEmpty);
+  });
+
+  test(
+    'a mapped target without its marker is protected even when registered',
+    () async {
+      calendar.events['match'] = event('match', title: 'New');
+      calendar.events['target'] = event('target', calendar: 'family');
+      await map('match', 'target');
+      expect((await preview()).errors, isNotEmpty);
+      expect((await sync()).updated, isEmpty);
+      expect(calendar.deleted, isEmpty);
+    },
+  );
+
+  test(
+    'confirmed delete removes the creation registry only for its target',
+    () async {
+      await removeSource();
+      await db.insertCreatedEvent('family', 'other');
+      final plan = await preview();
+      expect(await engine.deleteConfirmedTargets(plan.toDelete), isTrue);
+      expect(await db.isEventCreatedBySync('family', 'target'), isFalse);
+      expect(await db.isEventCreatedBySync('family', 'other'), isTrue);
+    },
+  );
+
+  test(
+    'reverse sync skips a target actually created by the first profile',
+    () async {
+      calendar.events['match'] = event('match');
+      expect((await sync()).synced, ['match']);
+      final reverse = await profiles.createProfile(
+        name: 'Reverse',
+        sourceCalendarId: 'family',
+        targetCalendarId: 'source',
+        eventName: '',
+        intervalMinutes: 60,
+        enabled: true,
+      );
+      final result = await engine.runSync(
+        profileId: reverse.id,
+        sourceCalendarId: 'family',
+        targetCalendarId: 'source',
         syncEventName: '',
       );
+      expect(result.skipped, ['created-1']);
+      expect(calendar.creates, 1);
+    },
+  );
 
-      expect(plan.toCreate, hasLength(1));
-      expect(plan.toCreate.first.projectedTitle, 'Doctor Appointment');
-    });
-
-    test('non-empty syncEventName uses syncEventName as projectedTitle', () async {
-      final srcEvent = _makeEvent('src-1', end: futureEnd,
-          start: futureEnd.subtract(const Duration(hours: 1)));
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-
-      final plan = await engine.runDryRun(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: 'Busy',
-      );
-
-      expect(plan.toCreate, hasLength(1));
-      expect(plan.toCreate.first.projectedTitle, 'Busy');
-    });
+  test('the same source ID is independently scoped to profiles', () async {
+    calendar.events['match'] = event('match');
+    final second = await profiles.createProfile(
+      name: 'Different destination',
+      sourceCalendarId: 'source',
+      targetCalendarId: 'other-family',
+      eventName: '',
+      intervalMinutes: 60,
+      enabled: true,
+    );
+    expect((await sync()).synced, ['match']);
+    final result = await engine.runSync(
+      profileId: second.id,
+      sourceCalendarId: 'source',
+      targetCalendarId: 'other-family',
+      syncEventName: '',
+    );
+    expect(result.synced, ['match']);
+    expect(
+      (await db.listMappingsForProfile(
+        profile.id,
+      )).single['target_calendar_id'],
+      'family',
+    );
+    expect(
+      (await db.listMappingsForProfile(second.id)).single['target_calendar_id'],
+      'other-family',
+    );
   });
 
-  group('copyDescription', () {
-    final start = DateTime.utc(2027, 6, 1, 10, 0);
-    final end = DateTime.utc(2027, 6, 1, 11, 0);
-
-    test('create path with copyDescription=true includes source description', () async {
-      final srcEvent = Event(
-        eventId: 'src-1',
-        instanceId: 'src-1',
-        calendarId: sourceCalId,
-        title: 'Test',
-        description: 'Q3 planning notes',
-        startDate: start,
-        endDate: end,
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
+  test(
+    'five regular series occurrences produce five standalone mapped targets',
+    () async {
+      for (var index = 0; index < 5; index++) {
+        calendar.events['slot-$index'] = event(
+          'series',
+          instance: 'series@$index',
+          recurring: true,
+          from: start.add(Duration(days: index)),
+          until: end.add(Duration(days: index)),
+        );
+      }
+      expect((await sync()).synced, List.filled(5, 'series'));
+      final rows = await db.listMappingsForProfile(profile.id);
+      expect(rows.map((row) => row['source_instance_id']).toSet(), {
+        for (var i = 0; i < 5; i++) 'series@$i',
+      });
+      expect(rows.map((row) => row['target_event_id']).toSet(), hasLength(5));
+      expect(
+        calendar.events.values
+            .where((e) => e.calendarId == 'family')
+            .every((e) => !e.isRecurring),
+        isTrue,
       );
+    },
+  );
 
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-1'))
-          .thenAnswer((_) async => false);
-      when(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Q3 planning notes\n\nTest\n---\n🔃 Automatically created by CalSync',
-        isAllDay: false,
-      )).thenAnswer((_) async => 'new-id-1');
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId, sourceEventId: 'src-1',
-        targetCalendarId: targetCalId, targetEventId: 'new-id-1',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'new-id-1'))
-          .thenAnswer((_) async {});
+  test(
+    'positive series deletion proposes all future slots but no calendar write',
+    () async {
+      for (var index = 0; index < 3; index++) {
+        calendar.events['target-$index'] = target('target-$index');
+        await map('series', 'target-$index', instance: 'series@$index');
+        calendar.changes[('series', 'series@$index')] = (
+          removed: true,
+          movedId: null,
+        );
+      }
+      final plan = await preview();
+      expect(plan.toDelete, hasLength(3));
+      expect((await sync()).deleted, isEmpty);
+      expect(calendar.deleted, isEmpty);
+      expect(await db.listMappingsForProfile(profile.id), hasLength(3));
+    },
+  );
 
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-        copyDescription: true,
+  test(
+    'privacy option transitions rewrite the same target in both directions',
+    () async {
+      calendar.events['match'] = event('match');
+      expect((await sync()).synced, ['match']);
+      expect((await sync(omitSourceTitle: true)).updated, ['match']);
+      expect(
+        calendar.events['created-1']!.description,
+        isNot(contains('Training')),
       );
+      expect((await sync(omitSourceTitle: false)).updated, ['match']);
+      expect(calendar.events['created-1']!.description, contains('Training'));
+      expect(calendar.creates, 1);
+      expect(calendar.deleted, isEmpty);
+    },
+  );
 
-      verify(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Q3 planning notes\n\nTest\n---\n🔃 Automatically created by CalSync',
-        isAllDay: false,
-      )).called(1);
-      expect(result.synced, ['src-1']);
-    });
+  test(
+    'a private-title change remains detectable when the visible title is fixed',
+    () async {
+      calendar.events['match'] = event('match');
+      expect((await sync(title: 'Busy', omitSourceTitle: true)).synced, [
+        'match',
+      ]);
+      final old = calendar.events['created-1']!.description;
+      calendar.events['match'] = event('match', title: 'Changed training');
+      expect((await sync(title: 'Busy', omitSourceTitle: true)).updated, [
+        'match',
+      ]);
+      expect(calendar.events['created-1']!.title, 'Busy');
+      expect(calendar.events['created-1']!.description, isNot(old));
+    },
+  );
 
-    test('copyDescription=true with null source description falls back to standard', () async {
-      final srcEvent = Event(
-        eventId: 'src-2',
-        instanceId: 'src-2',
-        calendarId: sourceCalId,
-        title: 'Test',
-        description: null,
-        startDate: start,
-        endDate: end,
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
-      );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-2'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-2'))
-          .thenAnswer((_) async => false);
-      when(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Test\n---\n🔃 Automatically created by CalSync',
-        isAllDay: false,
-      )).thenAnswer((_) async => 'new-id-2');
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId, sourceEventId: 'src-2',
-        targetCalendarId: targetCalId, targetEventId: 'new-id-2',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'new-id-2'))
-          .thenAnswer((_) async {});
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-        copyDescription: true,
-      );
-
-      verify(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Test\n---\n🔃 Automatically created by CalSync',
-        isAllDay: false,
-      )).called(1);
-      expect(result.synced, ['src-2']);
-    });
+  test('a failed journal reservation cannot reach the provider', () async {
+    await removeSource();
+    final plan = await preview();
+    final raw = await db.database;
+    await raw.execute("""
+      CREATE TRIGGER fail_mutation_reserve BEFORE INSERT ON sync_target_mutations
+      BEGIN SELECT RAISE(ABORT, 'test failure'); END
+    """);
+    expect(await engine.deleteConfirmedTargets(plan.toDelete), isFalse);
+    expect(calendar.deleted, isEmpty);
+    expect(await db.hasPendingMutations(profile.id), isFalse);
   });
 
-  group('copyLocation', () {
-    final start = DateTime.utc(2027, 6, 1, 10, 0);
-    final end = DateTime.utc(2027, 6, 1, 11, 0);
+  test(
+    'an unknown update outcome leaves a visible barrier across reopen',
+    () async {
+      calendar.events['match'] = event('match', title: 'Changed');
+      calendar.events['target'] = target('target');
+      await map('match', 'target');
+      calendar.failAfterUpdate = true;
+      expect((await sync()).errors, isNotEmpty);
+      expect(calendar.updated, ['target']);
+      await (await db.database).close();
+      DatabaseProvider.setTestPath('${temp.path}/calendar.db');
+      db = MappingDatabase();
+      engine = SyncEngine(calendar, db);
+      expect(await db.hasPendingMutations(profile.id), isTrue);
+      expect((await preview()).errors.single, contains('unconfirmed'));
+      expect((await sync()).updated, isEmpty);
+      expect(calendar.updated, ['target']);
+      expect(calendar.creates, 0);
+    },
+  );
 
-    test('create path with copyLocation=true passes location to createEvent', () async {
-      final srcEvent = Event(
-        eventId: 'src-3',
-        instanceId: 'src-3',
-        calendarId: sourceCalId,
-        title: 'Test',
-        location: 'Conference Room A',
-        startDate: start,
-        endDate: end,
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
+  test(
+    'the provider runs outside SQLite and sees the committed mutation intent',
+    () async {
+      await removeSource();
+      final plan = await preview();
+      calendar.beforeDelete = () async {
+        expect(
+          await db
+              .hasPendingMutations(profile.id)
+              .timeout(const Duration(seconds: 2)),
+          isTrue,
+        );
+        await expectLater(profiles.deleteProfile(profile.id), throwsStateError);
+      };
+      expect(await engine.deleteConfirmedTargets(plan.toDelete), isTrue);
+      expect(await db.hasPendingMutations(profile.id), isFalse);
+    },
+  );
+
+  test(
+    'an actual failed SQLite commit retains deletion intent and frees the shared database',
+    () async {
+      await removeSource();
+      final plan = await preview();
+      final raw = await db.database;
+      await raw.execute(
+        'CREATE TABLE commit_guard_parent (id INTEGER PRIMARY KEY)',
       );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-3'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-3'))
-          .thenAnswer((_) async => false);
-      when(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Test\n---\n🔃 Automatically created by CalSync',
-        isAllDay: false,
-        location: 'Conference Room A',
-      )).thenAnswer((_) async => 'new-id-3');
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId, sourceEventId: 'src-3',
-        targetCalendarId: targetCalId, targetEventId: 'new-id-3',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'new-id-3'))
-          .thenAnswer((_) async {});
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-        copyLocation: true,
-      );
-
-      verify(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Test\n---\n🔃 Automatically created by CalSync',
-        isAllDay: false,
-        location: 'Conference Room A',
-      )).called(1);
-      expect(result.synced, ['src-3']);
-    });
-
-    test('create path with copyLocation=false does not pass location', () async {
-      final srcEvent = Event(
-        eventId: 'src-4',
-        instanceId: 'src-4',
-        calendarId: sourceCalId,
-        title: 'Test',
-        location: 'Conference Room A',
-        startDate: start,
-        endDate: end,
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
-      );
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-4'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-4'))
-          .thenAnswer((_) async => false);
-      when(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Test\n---\n🔃 Automatically created by CalSync',
-        isAllDay: false,
-        location: null,
-      )).thenAnswer((_) async => 'new-id-4');
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId, sourceEventId: 'src-4',
-        targetCalendarId: targetCalId, targetEventId: 'new-id-4',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'new-id-4'))
-          .thenAnswer((_) async {});
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-      );
-
-      verify(() => calendarService.createEvent(
-        targetCalId, syncName, start, end,
-        description: 'Test\n---\n🔃 Automatically created by CalSync',
-        isAllDay: false,
-        location: null,
-      )).called(1);
-      expect(result.synced, ['src-4']);
-    });
-  });
-
-  group('omitSourceTitle', () {
-    final start = DateTime.utc(2027, 6, 1, 10, 0);
-    final end = DateTime.utc(2027, 6, 1, 11, 0);
-    const marker = '🔃 Automatically created by CalSync';
-    final expectedHash =
-        'de691f9d29a02d009e10def2bd0c4b8e7fe3eff4e0ef002eadbc329e27882333';
-
-    Event makeEvent(String id, String title) {
-      return Event(
-        eventId: id,
-        instanceId: id,
-        calendarId: sourceCalId,
-        title: title,
-        startDate: start,
-        endDate: end,
-        isAllDay: false,
-        availability: EventAvailability.busy,
-        status: EventStatus.none,
-        isRecurring: false,
-      );
-    }
-
-    test('create path with omitSourceTitle=true embeds SHA256, not plaintext title',
-        () async {
-      final srcEvent = makeEvent('src-priv-1', 'Doctor Appointment');
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => []);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-priv-1'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-priv-1'))
-          .thenAnswer((_) async => false);
-      when(() => calendarService.createEvent(
-        targetCalId,
-        syncName,
-        start,
-        end,
-        description: '$expectedHash\n---\n$marker',
-        isAllDay: false,
-      )).thenAnswer((_) async => 'new-priv-1');
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        sourceEventId: 'src-priv-1',
-        targetCalendarId: targetCalId,
-        targetEventId: 'new-priv-1',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'new-priv-1'))
-          .thenAnswer((_) async {});
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-        omitSourceTitle: true,
-      );
-
-      verify(() => calendarService.createEvent(
-        targetCalId,
-        syncName,
-        start,
-        end,
-        description: '$expectedHash\n---\n$marker',
-        isAllDay: false,
-      )).called(1);
-      expect(result.synced, ['src-priv-1']);
-    });
-
-    test('title change triggers update when omitSourceTitle=true', () async {
-      final srcEvent = makeEvent('src-priv-2', 'Doctor Visit');
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => [
-            {
-              'id': 1,
-              'profile_id': profileId,
-              'source_calendar_id': sourceCalId,
-              'source_event_id': 'src-priv-2',
-              'target_calendar_id': targetCalId,
-              'target_event_id': 'old-priv-2',
-              'synced_at': '2027-01-01T00:00:00Z',
-              'canonical_time': null,
-            }
-          ]);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-priv-2'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-priv-2'))
-          .thenAnswer((_) async => true);
-      // Old target description contains the SHA256 of the OLD title, not the new one
-      final oldHash =
-          'de691f9d29a02d009e10def2bd0c4b8e7fe3eff4e0ef002eadbc329e27882333';
-      when(() => calendarService.getEvent('old-priv-2')).thenAnswer((_) async =>
-          Event(
-            eventId: 'old-priv-2',
-            instanceId: 'old-priv-2',
-            calendarId: targetCalId,
-            title: syncName,
-            description: '$oldHash\n---\n$marker',
-            startDate: start,
-            endDate: end,
-            isAllDay: false,
-            availability: EventAvailability.busy,
-            status: EventStatus.none,
-            isRecurring: false,
-          ));
-      // New title hash
-      final newHash =
-          sha256.convert('Doctor Visit'.codeUnits).toString();
-      when(() => calendarService.createEvent(
-        targetCalId,
-        syncName,
-        start,
-        end,
-        description: '$newHash\n---\n$marker',
-        isAllDay: false,
-      )).thenAnswer((_) async => 'new-priv-2');
-      when(() => calendarService.deleteEvent('old-priv-2'))
-          .thenAnswer((_) async => const CalendarDeleteResult(success: true));
-      when(() => mappingDb.deleteCreatedEvent(targetCalId, 'old-priv-2'))
-          .thenAnswer((_) async {});
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        sourceEventId: 'src-priv-2',
-        targetCalendarId: targetCalId,
-        targetEventId: 'new-priv-2',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'new-priv-2'))
-          .thenAnswer((_) async {});
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-        omitSourceTitle: true,
-      );
-
-      verify(() => calendarService.createEvent(
-        targetCalId,
-        syncName,
-        start,
-        end,
-        description: '$newHash\n---\n$marker',
-        isAllDay: false,
-      )).called(1);
-      expect(result.updated, ['src-priv-2']);
-    });
-
-    test('toggling omitSourceTitle from false to true cleans up plaintext title',
-        () async {
-      final srcEvent = makeEvent('src-priv-3', 'Doctor Appointment');
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => [
-            {
-              'id': 2,
-              'profile_id': profileId,
-              'source_calendar_id': sourceCalId,
-              'source_event_id': 'src-priv-3',
-              'target_calendar_id': targetCalId,
-              'target_event_id': 'old-priv-3',
-              'synced_at': '2027-01-01T00:00:00Z',
-              'canonical_time': null,
-            }
-          ]);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-priv-3'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-priv-3'))
-          .thenAnswer((_) async => true);
-      // Old target still has plaintext title (from omitSourceTitle=false era)
-      when(() => calendarService.getEvent('old-priv-3')).thenAnswer((_) async =>
-          Event(
-            eventId: 'old-priv-3',
-            instanceId: 'old-priv-3',
-            calendarId: targetCalId,
-            title: syncName,
-            description: 'Doctor Appointment\n---\n$marker',
-            startDate: start,
-            endDate: end,
-            isAllDay: false,
-            availability: EventAvailability.busy,
-            status: EventStatus.none,
-            isRecurring: false,
-          ));
-      when(() => calendarService.createEvent(
-        targetCalId,
-        syncName,
-        start,
-        end,
-        description: '$expectedHash\n---\n$marker',
-        isAllDay: false,
-      )).thenAnswer((_) async => 'new-priv-3');
-      when(() => calendarService.deleteEvent('old-priv-3'))
-          .thenAnswer((_) async => const CalendarDeleteResult(success: true));
-      when(() => mappingDb.deleteCreatedEvent(targetCalId, 'old-priv-3'))
-          .thenAnswer((_) async {});
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        sourceEventId: 'src-priv-3',
-        targetCalendarId: targetCalId,
-        targetEventId: 'new-priv-3',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'new-priv-3'))
-          .thenAnswer((_) async {});
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-        omitSourceTitle: true,
-      );
-
-      verify(() => calendarService.createEvent(
-        targetCalId,
-        syncName,
-        start,
-        end,
-        description: '$expectedHash\n---\n$marker',
-        isAllDay: false,
-      )).called(1);
-      expect(result.updated, ['src-priv-3']);
-    });
-
-    test('toggling omitSourceTitle from true to false cleans up fingerprint',
-        () async {
-      final srcEvent = makeEvent('src-priv-4', 'Doctor Appointment');
-
-      when(() => calendarService.listEvents(sourceCalId, end: any(named: 'end')))
-          .thenAnswer((_) async => [srcEvent]);
-      when(() => mappingDb.listMappingsForCalendar(profileId, sourceCalId))
-          .thenAnswer((_) async => [
-            {
-              'id': 3,
-              'profile_id': profileId,
-              'source_calendar_id': sourceCalId,
-              'source_event_id': 'src-priv-4',
-              'target_calendar_id': targetCalId,
-              'target_event_id': 'old-priv-4',
-              'synced_at': '2027-01-01T00:00:00Z',
-              'canonical_time': null,
-            }
-          ]);
-      when(() => mappingDb.isEventCreatedBySync(sourceCalId, 'src-priv-4'))
-          .thenAnswer((_) async => false);
-      when(() => mappingDb.isEventSynced(profileId, sourceCalId, 'src-priv-4'))
-          .thenAnswer((_) async => true);
-      // Old target has the SHA256 (from omitSourceTitle=true era)
-      when(() => calendarService.getEvent('old-priv-4')).thenAnswer((_) async =>
-          Event(
-            eventId: 'old-priv-4',
-            instanceId: 'old-priv-4',
-            calendarId: targetCalId,
-            title: syncName,
-            description: '$expectedHash\n---\n$marker',
-            startDate: start,
-            endDate: end,
-            isAllDay: false,
-            availability: EventAvailability.busy,
-            status: EventStatus.none,
-            isRecurring: false,
-          ));
-      when(() => calendarService.createEvent(
-        targetCalId,
-        syncName,
-        start,
-        end,
-        description: 'Doctor Appointment\n---\n$marker',
-        isAllDay: false,
-      )).thenAnswer((_) async => 'new-priv-4');
-      when(() => calendarService.deleteEvent('old-priv-4'))
-          .thenAnswer((_) async => const CalendarDeleteResult(success: true));
-      when(() => mappingDb.deleteCreatedEvent(targetCalId, 'old-priv-4'))
-          .thenAnswer((_) async {});
-      when(() => mappingDb.insertMapping(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        sourceEventId: 'src-priv-4',
-        targetCalendarId: targetCalId,
-        targetEventId: 'new-priv-4',
-        syncedAt: any(named: 'syncedAt'),
-      )).thenAnswer((_) async {});
-      when(() => mappingDb.insertCreatedEvent(targetCalId, 'new-priv-4'))
-          .thenAnswer((_) async {});
-
-      final result = await engine.runSync(
-        profileId: profileId,
-        sourceCalendarId: sourceCalId,
-        targetCalendarId: targetCalId,
-        syncEventName: syncName,
-        omitSourceTitle: false,
-      );
-
-      verify(() => calendarService.createEvent(
-        targetCalId,
-        syncName,
-        start,
-        end,
-        description: 'Doctor Appointment\n---\n$marker',
-        isAllDay: false,
-      )).called(1);
-      expect(result.updated, ['src-priv-4']);
-    });
-  });
+      await raw.execute("""
+      CREATE TABLE commit_guard (
+        id INTEGER REFERENCES commit_guard_parent(id) DEFERRABLE INITIALLY DEFERRED
+      )
+    """);
+      await raw.execute("""
+      CREATE TRIGGER fail_commit_after_mutation AFTER DELETE ON sync_target_mutations
+      BEGIN INSERT INTO commit_guard(id) VALUES (1); END
+    """);
+      expect(await engine.deleteConfirmedTargets(plan.toDelete), isFalse);
+      expect(calendar.deleted, ['target']);
+      final journal = await raw
+          .query('sync_target_mutations')
+          .timeout(const Duration(seconds: 2));
+      expect(journal.single['operation'], 'delete');
+      expect(await db.profilesWithPendingCalendarWrites(), {profile.id});
+      expect(journal.single['target_event_id'], 'target');
+      expect(await db.isEventSynced(profile.id, 'source', 'match'), isTrue);
+      expect((await preview()).errors.single, contains('unconfirmed'));
+      expect(await engine.deleteConfirmedTargets(plan.toDelete), isFalse);
+      expect(calendar.deleted, ['target']);
+    },
+  );
 
   group('buildDescription', () {
     const marker = '🔃 Automatically created by CalSync';
@@ -2434,20 +1157,29 @@ void main() {
       expect(result, 'Q3 notes\n\nDoctor Appointment\n---\n$marker');
     });
 
-    test('copyDescription=true with null description returns standard format', () {
-      final result = buildDescription('Doctor Appointment', null, true);
-      expect(result, 'Doctor Appointment\n---\n$marker');
-    });
+    test(
+      'copyDescription=true with null description returns standard format',
+      () {
+        final result = buildDescription('Doctor Appointment', null, true);
+        expect(result, 'Doctor Appointment\n---\n$marker');
+      },
+    );
 
-    test('copyDescription=true with empty description returns standard format', () {
-      final result = buildDescription('Doctor Appointment', '', true);
-      expect(result, 'Doctor Appointment\n---\n$marker');
-    });
+    test(
+      'copyDescription=true with empty description returns standard format',
+      () {
+        final result = buildDescription('Doctor Appointment', '', true);
+        expect(result, 'Doctor Appointment\n---\n$marker');
+      },
+    );
 
-    test('copyDescription=false with null description returns standard format', () {
-      final result = buildDescription('Doctor Appointment', null, false);
-      expect(result, 'Doctor Appointment\n---\n$marker');
-    });
+    test(
+      'copyDescription=false with null description returns standard format',
+      () {
+        final result = buildDescription('Doctor Appointment', null, false);
+        expect(result, 'Doctor Appointment\n---\n$marker');
+      },
+    );
 
     test('omitSourceTitle=true replaces title with SHA256 fingerprint', () {
       final result = buildDescription(
@@ -2462,57 +1194,64 @@ void main() {
       );
     });
 
-    test('omitSourceTitle=true with copyDescription prepends source description', () {
-      final result = buildDescription(
-        'Doctor Appointment',
-        'Q3 notes',
-        true,
-        omitSourceTitle: true,
-      );
-      expect(
-        result,
-        'Q3 notes\n\nde691f9d29a02d009e10def2bd0c4b8e7fe3eff4e0ef002eadbc329e27882333\n---\n$marker',
-      );
-    });
+    test(
+      'omitSourceTitle=true with copyDescription prepends source description',
+      () {
+        final result = buildDescription(
+          'Doctor Appointment',
+          'Q3 notes',
+          true,
+          omitSourceTitle: true,
+        );
+        expect(
+          result,
+          'Q3 notes\n\nde691f9d29a02d009e10def2bd0c4b8e7fe3eff4e0ef002eadbc329e27882333\n---\n$marker',
+        );
+      },
+    );
 
-    test('omitSourceTitle=true with copyDescription and null source description', () {
-      final result = buildDescription(
-        'Doctor Appointment',
-        null,
-        true,
-        omitSourceTitle: true,
-      );
-      expect(
-        result,
-        'de691f9d29a02d009e10def2bd0c4b8e7fe3eff4e0ef002eadbc329e27882333\n---\n$marker',
-      );
-    });
+    test(
+      'omitSourceTitle=true with copyDescription and null source description',
+      () {
+        final result = buildDescription(
+          'Doctor Appointment',
+          null,
+          true,
+          omitSourceTitle: true,
+        );
+        expect(
+          result,
+          'de691f9d29a02d009e10def2bd0c4b8e7fe3eff4e0ef002eadbc329e27882333\n---\n$marker',
+        );
+      },
+    );
 
-    test('omitSourceTitle=true with copyDescription and empty source description', () {
-      final result = buildDescription(
-        'Doctor Appointment',
-        '',
-        true,
-        omitSourceTitle: true,
-      );
-      expect(
-        result,
-        'de691f9d29a02d009e10def2bd0c4b8e7fe3eff4e0ef002eadbc329e27882333\n---\n$marker',
-      );
-    });
+    test(
+      'omitSourceTitle=true with copyDescription and empty source description',
+      () {
+        final result = buildDescription(
+          'Doctor Appointment',
+          '',
+          true,
+          omitSourceTitle: true,
+        );
+        expect(
+          result,
+          'de691f9d29a02d009e10def2bd0c4b8e7fe3eff4e0ef002eadbc329e27882333\n---\n$marker',
+        );
+      },
+    );
 
-    test('omitSourceTitle=true with empty title uses well-known SHA256 of empty string', () {
-      final result = buildDescription(
-        '',
-        null,
-        false,
-        omitSourceTitle: true,
-      );
-      expect(
-        result,
-        'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n---\n$marker',
-      );
-    });
+    test(
+      'omitSourceTitle=true with empty title uses well-known SHA256 of empty string',
+      () {
+        final result = buildDescription('', null, false, omitSourceTitle: true);
+        expect(
+          result,
+          'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n---\n$marker',
+        );
+      },
+    );
 
     test('omitSourceTitle=true with known title matches hardcoded SHA256', () {
       // Locks the algorithm: any change to the hashing approach will fail this test.

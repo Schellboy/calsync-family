@@ -25,12 +25,14 @@ class DatabaseProvider {
     final path = join(dbPath, name);
     final db = await openDatabase(
       path,
-      version: 9,
+      version: 11,
       singleInstance: false,
       onConfigure: (db) async {
         await db.rawQuery('PRAGMA journal_mode=WAL');
       },
       onCreate: (db, version) async {
+        await _createReservations(db);
+        await _createMutationJournal(db);
         await db.execute('''
           CREATE TABLE sync_mappings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +83,8 @@ class DatabaseProvider {
         ''');
       },
       onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 10) await _createReservations(db);
+        if (oldVersion < 11) await _createMutationJournal(db);
         if (oldVersion < 2) {
           await db.execute('''
             CREATE TABLE sync_status (
@@ -177,4 +181,27 @@ class DatabaseProvider {
     );
     return db;
   }
+
+  Future<void> _createReservations(Database db) => db.execute('''
+    CREATE TABLE sync_creation_reservations (
+      profile_id TEXT NOT NULL,
+      source_calendar_id TEXT NOT NULL,
+      source_event_id TEXT NOT NULL,
+      source_instance_id TEXT NOT NULL,
+      PRIMARY KEY (profile_id, source_calendar_id, source_event_id, source_instance_id)
+    )
+  ''');
+
+  Future<void> _createMutationJournal(Database db) => db.execute('''
+    CREATE TABLE sync_target_mutations (
+      mapping_id INTEGER PRIMARY KEY,
+      profile_id TEXT NOT NULL,
+      target_calendar_id TEXT NOT NULL,
+      target_event_id TEXT NOT NULL,
+      operation TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      UNIQUE(target_calendar_id, target_event_id)
+    )
+  ''');
+
 }
