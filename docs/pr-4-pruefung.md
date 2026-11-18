@@ -31,7 +31,7 @@ Ein Test erzwingt einen echten SQLite-Commitfehler mit einer verzögerten Fremds
 
 ## Test-APK auf Android
 
-Lade im GitHub-Actions-Lauf **Build isolated Family test APK** das Artefakt **CalSync-Family-Isolated-Test-APK** herunter. Lokal erzeugt `flutter build apk --debug --flavor familyTest` dieselbe Variante. GitHub-Artefakte des öffentlichen Forks enthalten ausschließlich die Test-APK.
+Lade im GitHub-Actions-Lauf **Build isolated Family test APK** das Artefakt **CalSync-Family-Isolated-Test-APK** herunter. Lokal erzeugt `flutter build apk --debug --flavor familyTest` dieselbe Variante. Dieses Artefakt des öffentlichen Forks enthält ausschließlich die Test-APK.
 
 Die Test-App heißt **CalSync Family Test** und verwendet `de.schellboy.calsyncfamily.test`. Sie hat einen separaten App-Speicher sowie deaktivierte Sicherung und Geräteübertragung. Periodische, reaktive und Boot-Synchronisierung stehen in dieser Variante dauerhaft auf manuell. Neue Profile sind zunächst deaktiviert. Die App kann nur in ihren eigenen lokalen Test-Zielkalender schreiben.
 

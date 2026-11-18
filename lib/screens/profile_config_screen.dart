@@ -530,38 +530,39 @@ class _ProfileConfigScreenState extends State<ProfileConfigScreen>
                           ),
                         ),
                         const SizedBox(height: 16),
-                        if (!CalendarService.isFamilyTestBuild)
-                        DropdownMenu<int>(
-                          initialSelection: _intervalMinutes,
-                          label: const Text('Fallback Interval'),
-                          expandedInsets: EdgeInsets.zero,
-                          menuHeight: 240,
-                          dropdownMenuEntries: const [
-                            DropdownMenuEntry(
-                                value: 0, label: 'Off (manual only)'),
-                            DropdownMenuEntry(
-                                value: 15, label: '15 minutes'),
-                            DropdownMenuEntry(
-                                value: 30, label: '30 minutes'),
-                            DropdownMenuEntry(value: 60, label: '1 hour'),
-                            DropdownMenuEntry(value: 120, label: '2 hours'),
-                            DropdownMenuEntry(value: 360, label: '6 hours'),
-                          ],
-                          onSelected: (val) {
-                            if (val != null) {
-                              setState(() => _intervalMinutes = val);
-                            }
-                          },
-                        ),
-                        const SizedBox(height: 8),
-                        Align(
-                          alignment: Alignment.centerLeft,
-                          child: Text(
-                            'Changes are detected within seconds. '
-                            'The interval above is a fallback only.',
-                            style: hintStyle,
+                        if (!CalendarService.isFamilyTestBuild) ...[
+                          DropdownMenu<int>(
+                            initialSelection: _intervalMinutes,
+                            label: const Text('Fallback Interval'),
+                            expandedInsets: EdgeInsets.zero,
+                            menuHeight: 240,
+                            dropdownMenuEntries: const [
+                              DropdownMenuEntry(
+                                  value: 0, label: 'Off (manual only)'),
+                              DropdownMenuEntry(
+                                  value: 15, label: '15 minutes'),
+                              DropdownMenuEntry(
+                                  value: 30, label: '30 minutes'),
+                              DropdownMenuEntry(value: 60, label: '1 hour'),
+                              DropdownMenuEntry(value: 120, label: '2 hours'),
+                              DropdownMenuEntry(value: 360, label: '6 hours'),
+                            ],
+                            onSelected: (val) {
+                              if (val != null) {
+                                setState(() => _intervalMinutes = val);
+                              }
+                            },
                           ),
-                        ),
+                          const SizedBox(height: 8),
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              'Changes are detected within seconds. '
+                              'The interval above is a fallback only.',
+                              style: hintStyle,
+                            ),
+                          ),
+                        ],
                         const SizedBox(height: 16),
                         DropdownMenu<int>(
                           initialSelection: _syncWindowDays,
