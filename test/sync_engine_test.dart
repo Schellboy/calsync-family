@@ -1135,6 +1135,7 @@ void main() {
           .query('sync_target_mutations')
           .timeout(const Duration(seconds: 2));
       expect(journal.single['operation'], 'delete');
+      expect(await db.profilesWithPendingCalendarWrites(), {profile.id});
       expect(journal.single['target_event_id'], 'target');
       expect(await db.isEventSynced(profile.id, 'source', 'match'), isTrue);
       expect((await preview()).errors.single, contains('unconfirmed'));

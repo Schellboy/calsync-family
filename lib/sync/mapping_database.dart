@@ -228,6 +228,15 @@ class MappingDatabase {
     }));
   }
 
+  Future<Set<String>> profilesWithPendingCalendarWrites() async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      'SELECT profile_id FROM sync_target_mutations '
+      'UNION SELECT profile_id FROM sync_creation_reservations',
+    );
+    return {for (final row in rows) row['profile_id'] as String};
+  }
+
   Future<bool> hasPendingMutations(String profileId) async {
     final db = await database;
     final rows = await db.query(
